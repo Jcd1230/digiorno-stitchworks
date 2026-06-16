@@ -1,0 +1,29 @@
+[package]
+name = "designer1-tools"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Experimental Ink/Stitch JSON to Husqvarna/Viking Designer 1 SHV converter with CLI and egui UI"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6.1", features = ["derive"] }
+eframe = { version = "0.34.3", default-features = true }
+egui = "0.34.3"
+rfd = "0.17.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[lib]
+name = "designer1_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "designer1-cli"
+path = "src/bin/designer1-cli.rs"
+
+[[bin]]
+name = "designer1-gui"
+path = "src/bin/designer1-gui.rs"

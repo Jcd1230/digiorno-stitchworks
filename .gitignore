@@ -1,0 +1,7 @@
+/target
+*.SHV
+*.shv
+*.svg
+*.json
+!Cargo.toml
+!README.md
