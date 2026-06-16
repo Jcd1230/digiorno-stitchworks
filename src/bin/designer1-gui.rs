@@ -36,6 +36,7 @@ struct Designer1App {
     preview_width: u8,
     preview_height: u8,
     show_cm_grid: bool,
+    show_jumps: bool,
     path_zoom: f32,
     path_pan: Vec2,
 
@@ -59,6 +60,7 @@ impl Default for Designer1App {
             preview_width: 96,
             preview_height: 24,
             show_cm_grid: true,
+            show_jumps: true,
             path_zoom: 1.0,
             path_pan: Vec2::ZERO,
             status: "Load an Ink/Stitch JSON file to begin.".to_owned(),
@@ -169,6 +171,7 @@ impl eframe::App for Designer1App {
                 ui.separator();
                 ui.heading("Path view");
                 ui.checkbox(&mut self.show_cm_grid, "Show 1 cm grid");
+                ui.checkbox(&mut self.show_jumps, "Show jump stitches");
                 ui.horizontal(|ui| {
                     if ui.button("Reset view").clicked() {
                         self.path_zoom = 1.0;
@@ -272,6 +275,7 @@ impl eframe::App for Designer1App {
                     ui,
                     design,
                     self.show_cm_grid,
+                    self.show_jumps,
                     &mut self.path_zoom,
                     &mut self.path_pan,
                 );
@@ -384,6 +388,7 @@ fn draw_design_path(
     ui: &mut egui::Ui,
     design: &Design,
     show_cm_grid: bool,
+    show_jumps: bool,
     zoom: &mut f32,
     pan: &mut Vec2,
 ) {
@@ -436,24 +441,41 @@ fn draw_design_path(
     }
 
     let mut prev: Option<Pos2> = None;
+    let mut thread_index = 0usize;
+    let mut current_color = thread_color(design, thread_index);
     for p in &design.points {
         match &p.command {
             StitchCommand::End => break,
             StitchCommand::Jump | StitchCommand::Trim => {
                 let pos = map(p.x, p.y);
-                painter.circle_filled(pos, 1.5, Color32::from_gray(120));
+                if show_jumps {
+                    if let Some(prev_pos) = prev {
+                        draw_dotted_line(
+                            &painter,
+                            prev_pos,
+                            pos,
+                            Stroke::new(1.0, Color32::from_rgb(210, 42, 42)),
+                        );
+                    }
+                    painter.circle_filled(pos, 1.5, Color32::from_rgb(210, 42, 42));
+                }
                 prev = Some(pos);
             }
             StitchCommand::Stitch => {
                 let pos = map(p.x, p.y);
                 if let Some(prev_pos) = prev {
-                    painter.line_segment([prev_pos, pos], Stroke::new(1.0, Color32::BLACK));
+                    painter.line_segment([prev_pos, pos], Stroke::new(1.0, current_color));
                 } else {
-                    painter.circle_filled(pos, 1.5, Color32::BLACK);
+                    painter.circle_filled(pos, 1.5, current_color);
                 }
                 prev = Some(pos);
             }
-            StitchCommand::ColorChange | StitchCommand::Stop | StitchCommand::Other(_) => {
+            StitchCommand::ColorChange | StitchCommand::Stop => {
+                thread_index = (thread_index + 1).min(design.threads.len().saturating_sub(1));
+                current_color = thread_color(design, thread_index);
+                prev = None;
+            }
+            StitchCommand::Other(_) => {
                 prev = None;
             }
         }
@@ -518,10 +540,57 @@ fn mm(units: i32) -> String {
     format!("{:.1}", units as f32 * 0.1)
 }
 
+fn draw_dotted_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+
+    let direction = delta / length;
+    let dash = 5.0;
+    let gap = 4.0;
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + dash).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * dash_end],
+            stroke,
+        );
+        offset += dash + gap;
+    }
+}
+
+fn thread_color(design: &Design, index: usize) -> Color32 {
+    let Some(thread) = design.threads.get(index).or_else(|| design.threads.first()) else {
+        return Color32::BLACK;
+    };
+    parse_hex_color(thread.color.as_deref()).unwrap_or(Color32::BLACK)
+}
+
+fn parse_hex_color(value: Option<&str>) -> Option<Color32> {
+    let mut s = value?.trim();
+    if let Some(stripped) = s.strip_prefix('#') {
+        s = stripped;
+    }
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
 fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usize) {
     let cell = 5.0f32;
-    let desired = Vec2::new(width as f32 * cell, height as f32 * cell)
-        .min(Vec2::new(ui.available_width(), 260.0));
+    let native = Vec2::new(width as f32 * cell, height as f32 * cell);
+    let max_size = Vec2::new(ui.available_width(), 260.0);
+    let scale = (max_size.x / native.x)
+        .min(max_size.y / native.y)
+        .min(1.0)
+        .max(0.0);
+    let desired = native * scale;
     let (rect, _response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_gray(250));
