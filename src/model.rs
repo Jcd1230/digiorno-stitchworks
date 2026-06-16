@@ -67,7 +67,9 @@ impl FromStr for SignatureMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "official" | "viking" => Ok(Self::Official),
             "zero" | "zeros" | "embird" => Ok(Self::Zero),
-            other => Err(format!("unknown signature mode {other:?}; use 'official' or 'zero'")),
+            other => Err(format!(
+                "unknown signature mode {other:?}; use 'official' or 'zero'"
+            )),
         }
     }
 }
@@ -97,14 +99,16 @@ pub enum StitchCommand {
 
 impl StitchCommand {
     pub fn from_inkstitch_str(value: &str) -> Self {
-        match value.trim().to_ascii_uppercase().as_str() {
+        let normalized = value.trim().to_ascii_uppercase();
+        let command = normalized.split_whitespace().next().unwrap_or("");
+        match command {
             "STITCH" => Self::Stitch,
             "JUMP" => Self::Jump,
             "TRIM" => Self::Trim,
             "COLOR" | "COLOR_CHANGE" | "COLORCHANGE" => Self::ColorChange,
             "STOP" => Self::Stop,
             "END" => Self::End,
-            other => Self::Other(other.to_owned()),
+            _ => Self::Other(normalized),
         }
     }
 
@@ -215,4 +219,17 @@ pub struct DesignStats {
     pub top: i32,
     pub width: i32,
     pub height: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StitchCommand;
+
+    #[test]
+    fn parses_inkstitch_color_change_with_metadata() {
+        assert_eq!(
+            StitchCommand::from_inkstitch_str("COLOR_CHANGE t1 n2"),
+            StitchCommand::ColorChange
+        );
+    }
 }
