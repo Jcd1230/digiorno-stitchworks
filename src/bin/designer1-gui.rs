@@ -584,7 +584,10 @@ fn parse_hex_color(value: Option<&str>) -> Option<Color32> {
 
 fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usize) {
     let cell = 5.0f32;
-    let native = Vec2::new(width as f32 * cell, height as f32 * cell);
+    let bounds = preview_pixel_bounds(bytes, width, height).unwrap_or((0, width, 0, height));
+    let preview_width = bounds.1.saturating_sub(bounds.0).max(1);
+    let preview_height = bounds.3.saturating_sub(bounds.2).max(1);
+    let native = Vec2::new(preview_width as f32 * cell, preview_height as f32 * cell);
     let max_size = Vec2::new(ui.available_width(), 260.0);
     let scale = (max_size.x / native.x)
         .min(max_size.y / native.y)
@@ -595,11 +598,11 @@ fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usiz
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_gray(250));
 
-    let sx = rect.width() / width.max(1) as f32;
-    let sy = rect.height() / height.max(1) as f32;
+    let sx = rect.width() / preview_width as f32;
+    let sy = rect.height() / preview_height as f32;
     let stride = width.div_ceil(2);
-    for y in 0..height {
-        for x in 0..width {
+    for y in bounds.2..bounds.3 {
+        for x in bounds.0..bounds.1 {
             let byte = bytes.get(y * stride + x / 2).copied().unwrap_or(0);
             let value = if x % 2 == 0 { byte >> 4 } else { byte & 0x0f };
             if value == 0 {
@@ -607,10 +610,50 @@ fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usiz
             }
             let shade = 240u8.saturating_sub(value.saturating_mul(28));
             let r = Rect::from_min_size(
-                Pos2::new(rect.left() + x as f32 * sx, rect.top() + y as f32 * sy),
+                Pos2::new(
+                    rect.left() + (x - bounds.0) as f32 * sx,
+                    rect.top() + (y - bounds.2) as f32 * sy,
+                ),
                 Vec2::new(sx.max(1.0), sy.max(1.0)),
             );
             painter.rect_filled(r, 0.0, Color32::from_gray(shade));
         }
+    }
+}
+
+fn preview_pixel_bounds(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let stride = width.div_ceil(2);
+    let mut left = width;
+    let mut right = 0usize;
+    let mut top = height;
+    let mut bottom = 0usize;
+
+    for y in 0..height {
+        for x in 0..width {
+            let byte = bytes.get(y * stride + x / 2).copied().unwrap_or(0);
+            let value = if x % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+            if value == 0 {
+                continue;
+            }
+            left = left.min(x);
+            right = right.max(x + 1);
+            top = top.min(y);
+            bottom = bottom.max(y + 1);
+        }
+    }
+
+    if left < right && top < bottom {
+        Some((
+            left.saturating_sub(1),
+            (right + 1).min(width),
+            top.saturating_sub(1),
+            (bottom + 1).min(height),
+        ))
+    } else {
+        None
     }
 }
