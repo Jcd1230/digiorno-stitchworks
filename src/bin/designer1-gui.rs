@@ -6,6 +6,9 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use std::path::{Path, PathBuf};
 
+const PREVIEW_WIDTH: u8 = 96;
+const PREVIEW_HEIGHT: u8 = 24;
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -33,8 +36,6 @@ struct Designer1App {
     center: bool,
     input_y_axis: InputYAxis,
     signature: SignatureMode,
-    preview_width: u8,
-    preview_height: u8,
     show_cm_grid: bool,
     show_jumps: bool,
     path_zoom: f32,
@@ -57,8 +58,6 @@ impl Default for Designer1App {
             center: true,
             input_y_axis: InputYAxis::Down,
             signature: SignatureMode::Official,
-            preview_width: 96,
-            preview_height: 24,
             show_cm_grid: true,
             show_jumps: true,
             path_zoom: 1.0,
@@ -148,22 +147,6 @@ impl eframe::App for Designer1App {
                         );
                     });
 
-                ui.horizontal(|ui| {
-                    ui.label("Preview");
-                    ui.add(
-                        egui::DragValue::new(&mut self.preview_width)
-                            .speed(1)
-                            .range(1..=255),
-                    );
-                    ui.label("×");
-                    ui.add(
-                        egui::DragValue::new(&mut self.preview_height)
-                            .speed(1)
-                            .range(1..=255),
-                    );
-                });
-
-                ui.add_space(8.0);
                 if ui.button("Rebuild preview + SHV bytes").clicked() {
                     self.rebuild_current();
                 }
@@ -255,12 +238,12 @@ impl eframe::App for Designer1App {
 
                 ui.separator();
                 ui.heading("Embedded SHV thumbnail preview");
-                if let Some(bytes) = &self.preview_bytes {
-                    draw_4bpp_preview(
+                if let Some(design) = &self.design {
+                    draw_thread_thumbnail(
                         ui,
-                        bytes,
-                        self.preview_width as usize,
-                        self.preview_height as usize,
+                        design,
+                        PREVIEW_WIDTH as usize,
+                        PREVIEW_HEIGHT as usize,
                     );
                 } else {
                     ui.label("No preview built.");
@@ -338,12 +321,12 @@ impl Designer1App {
         let options = ShvOptions {
             name: None,
             signature: self.signature,
-            preview_width: self.preview_width,
-            preview_height: self.preview_height,
+            preview_width: PREVIEW_WIDTH,
+            preview_height: PREVIEW_HEIGHT,
         };
         let shv = build_shv(&design, &options)?;
         let report = validate_generated_shv(&shv)?;
-        let preview = render_preview_4bpp(&design, self.preview_width, self.preview_height, 4)?;
+        let preview = render_preview_4bpp(&design, PREVIEW_WIDTH, PREVIEW_HEIGHT, 4)?;
 
         self.design = Some(design);
         self.shv_bytes = Some(shv);
@@ -582,9 +565,10 @@ fn parse_hex_color(value: Option<&str>) -> Option<Color32> {
     Some(Color32::from_rgb(r, g, b))
 }
 
-fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usize) {
+fn draw_thread_thumbnail(ui: &mut egui::Ui, design: &Design, width: usize, height: usize) {
+    let pixels = render_thread_thumbnail(design, width, height);
     let cell = 5.0f32;
-    let bounds = preview_pixel_bounds(bytes, width, height).unwrap_or((0, width, 0, height));
+    let bounds = thumbnail_pixel_bounds(&pixels, width, height).unwrap_or((0, width, 0, height));
     let preview_width = bounds.1.saturating_sub(bounds.0).max(1);
     let preview_height = bounds.3.saturating_sub(bounds.2).max(1);
     let native = Vec2::new(preview_width as f32 * cell, preview_height as f32 * cell);
@@ -600,15 +584,11 @@ fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usiz
 
     let sx = rect.width() / preview_width as f32;
     let sy = rect.height() / preview_height as f32;
-    let stride = width.div_ceil(2);
     for y in bounds.2..bounds.3 {
         for x in bounds.0..bounds.1 {
-            let byte = bytes.get(y * stride + x / 2).copied().unwrap_or(0);
-            let value = if x % 2 == 0 { byte >> 4 } else { byte & 0x0f };
-            if value == 0 {
+            let Some(color) = pixels[y * width + x] else {
                 continue;
-            }
-            let shade = 240u8.saturating_sub(value.saturating_mul(28));
+            };
             let r = Rect::from_min_size(
                 Pos2::new(
                     rect.left() + (x - bounds.0) as f32 * sx,
@@ -616,17 +596,139 @@ fn draw_4bpp_preview(ui: &mut egui::Ui, bytes: &[u8], width: usize, height: usiz
                 ),
                 Vec2::new(sx.max(1.0), sy.max(1.0)),
             );
-            painter.rect_filled(r, 0.0, Color32::from_gray(shade));
+            painter.rect_filled(r, 0.0, color);
         }
     }
 }
 
-fn preview_pixel_bounds(
-    bytes: &[u8],
+fn render_thread_thumbnail(design: &Design, width: usize, height: usize) -> Vec<Option<Color32>> {
+    let drawable: Vec<_> = design
+        .points
+        .iter()
+        .filter(|p| p.command.is_positioning_move())
+        .collect();
+
+    let (min_x, max_x, min_y, max_y) = if drawable.is_empty() {
+        (0, 1, 0, 1)
+    } else {
+        (
+            drawable.iter().map(|p| p.x).min().unwrap(),
+            drawable.iter().map(|p| p.x).max().unwrap(),
+            drawable.iter().map(|p| p.y).min().unwrap(),
+            drawable.iter().map(|p| p.y).max().unwrap(),
+        )
+    };
+
+    let span_x = (max_x - min_x).max(1) as f64;
+    let span_y = (max_y - min_y).max(1) as f64;
+    let pad = 2.0;
+    let scale_x = ((width as f64 - 1.0) - 2.0 * pad) / span_x;
+    let scale_y = ((height as f64 - 1.0) - 2.0 * pad) / span_y;
+    let scale = scale_x.min(scale_y).max(0.001);
+    let to_pixel = |x: i32, y: i32| -> (i32, i32) {
+        let px = ((x - min_x) as f64 * scale + pad).round() as i32;
+        let py = ((max_y - y) as f64 * scale + pad).round() as i32;
+        (
+            px.clamp(0, width as i32 - 1),
+            py.clamp(0, height as i32 - 1),
+        )
+    };
+
+    let mut pixels = vec![None; width * height];
+    let mut prev: Option<(i32, i32)> = None;
+    let mut thread_index = 0usize;
+    let mut current_color = thread_color(design, thread_index);
+    for p in &design.points {
+        match &p.command {
+            StitchCommand::End => break,
+            StitchCommand::Jump | StitchCommand::Trim => {
+                let pt = to_pixel(p.x, p.y);
+                set_thumbnail_pixel(&mut pixels, width, height, pt.0, pt.1, current_color);
+                prev = Some(pt);
+            }
+            StitchCommand::Stitch => {
+                let pt = to_pixel(p.x, p.y);
+                if let Some(prev_pt) = prev {
+                    draw_thumbnail_line(
+                        &mut pixels,
+                        width,
+                        height,
+                        prev_pt.0,
+                        prev_pt.1,
+                        pt.0,
+                        pt.1,
+                        current_color,
+                    );
+                } else {
+                    set_thumbnail_pixel(&mut pixels, width, height, pt.0, pt.1, current_color);
+                }
+                prev = Some(pt);
+            }
+            StitchCommand::ColorChange | StitchCommand::Stop => {
+                thread_index = (thread_index + 1).min(design.threads.len().saturating_sub(1));
+                current_color = thread_color(design, thread_index);
+                prev = None;
+            }
+            StitchCommand::Other(_) => {
+                prev = None;
+            }
+        }
+    }
+
+    pixels
+}
+
+fn set_thumbnail_pixel(
+    pixels: &mut [Option<Color32>],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: Color32,
+) {
+    if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
+        pixels[y as usize * width + x as usize] = Some(color);
+    }
+}
+
+fn draw_thumbnail_line(
+    pixels: &mut [Option<Color32>],
+    width: usize,
+    height: usize,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    color: Color32,
+) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        set_thumbnail_pixel(pixels, width, height, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn thumbnail_pixel_bounds(
+    pixels: &[Option<Color32>],
     width: usize,
     height: usize,
 ) -> Option<(usize, usize, usize, usize)> {
-    let stride = width.div_ceil(2);
     let mut left = width;
     let mut right = 0usize;
     let mut top = height;
@@ -634,9 +736,7 @@ fn preview_pixel_bounds(
 
     for y in 0..height {
         for x in 0..width {
-            let byte = bytes.get(y * stride + x / 2).copied().unwrap_or(0);
-            let value = if x % 2 == 0 { byte >> 4 } else { byte & 0x0f };
-            if value == 0 {
+            if pixels[y * width + x].is_none() {
                 continue;
             }
             left = left.min(x);
