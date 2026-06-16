@@ -1,9 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use designer1_tools::inkstitch::{load_inkstitch_json_file, LoadOptions};
+use designer1_tools::disk::{DiskExportOptions, export_single_menu_disk};
+use designer1_tools::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use designer1_tools::model::{InputYAxis, SignatureMode};
 use designer1_tools::preview::design_path_svg;
-use designer1_tools::shv::{build_shv, validate_generated_shv, ShvOptions};
+use designer1_tools::shv::{ShvOptions, build_shv, validate_generated_shv};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -25,6 +26,8 @@ enum Command {
     PreviewSvg(PreviewSvgArgs),
     /// Validate/read back a generated SHV file.
     ValidateShv(ValidateShvArgs),
+    /// Export a folder of JSON files as a single-menu Designer 1 disk layout.
+    ExportDisk(ExportDiskArgs),
 }
 
 #[derive(Debug, Args)]
@@ -113,6 +116,36 @@ struct ValidateShvArgs {
     input: PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct ExportDiskArgs {
+    /// Disk root folder containing Ink/Stitch JSON files.
+    root: PathBuf,
+
+    /// Coordinate scale into SHV units. Default assumes Ink/Stitch JSON units are already 0.1 mm-ish.
+    #[arg(long, default_value_t = 1.0)]
+    scale: f64,
+
+    /// Do not center each design around SHV origin.
+    #[arg(long)]
+    no_center: bool,
+
+    /// Y-axis convention of input JSON. Ink/Stitch/SVG normally uses +Y down.
+    #[arg(long, value_enum, default_value_t = YAxisArg::Down)]
+    input_y_axis: YAxisArg,
+
+    /// Signature/notice region to write.
+    #[arg(long, value_enum, default_value_t = SignatureArg::Official)]
+    signature: SignatureArg,
+
+    /// Root disk title used in MENU_SEL.PHV.
+    #[arg(long, default_value = "Designer 1 Disk")]
+    disk_title: String,
+
+    /// Root menu label used in MENU_SEL.PHV.
+    #[arg(long, default_value = "Menu 1")]
+    menu_label: String,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum YAxisArg {
     Down,
@@ -150,6 +183,7 @@ fn main() -> Result<()> {
         Command::Inspect(args) => inspect(args),
         Command::PreviewSvg(args) => preview_svg(args),
         Command::ValidateShv(args) => validate_shv(args),
+        Command::ExportDisk(args) => export_disk(args),
     }
 }
 
@@ -216,8 +250,25 @@ fn preview_svg(args: PreviewSvgArgs) -> Result<()> {
 }
 
 fn validate_shv(args: ValidateShvArgs) -> Result<()> {
-    let blob = std::fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
+    let blob =
+        std::fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
     let report = validate_generated_shv(&blob)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn export_disk(args: ExportDiskArgs) -> Result<()> {
+    let report = export_single_menu_disk(
+        &args.root,
+        &DiskExportOptions {
+            signature: args.signature.into(),
+            scale: args.scale,
+            center: !args.no_center,
+            input_y_axis: args.input_y_axis.into(),
+            disk_title: args.disk_title,
+            menu_label: args.menu_label,
+        },
+    )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

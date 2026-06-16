@@ -6,6 +6,7 @@
 //! - [`shv`] writes and validates the empirical SHV layout.
 //! - [`model`] contains the shared domain model.
 
+pub mod disk;
 pub mod inkstitch;
 pub mod model;
 pub mod preview;

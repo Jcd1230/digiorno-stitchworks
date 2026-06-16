@@ -1,3 +1,6 @@
+use designer1_tools::disk::{
+    DiskDesignInput, DiskExportOptions, export_single_menu_disk, load_disk_designs,
+};
 use designer1_tools::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use designer1_tools::model::{Design, InputYAxis, SignatureMode, StitchCommand};
 use designer1_tools::preview::render_preview_4bpp;
@@ -26,6 +29,9 @@ fn main() -> eframe::Result {
 
 struct Designer1App {
     input_path: Option<PathBuf>,
+    disk_root: Option<PathBuf>,
+    disk_designs: Vec<DiskDesignInput>,
+    selected_disk_index: Option<usize>,
     design: Option<Design>,
     shv_bytes: Option<Vec<u8>>,
     report: Option<ShvReadbackReport>,
@@ -49,6 +55,9 @@ impl Default for Designer1App {
     fn default() -> Self {
         Self {
             input_path: None,
+            disk_root: None,
+            disk_designs: Vec::new(),
+            selected_disk_index: None,
             design: None,
             shv_bytes: None,
             report: None,
@@ -79,11 +88,17 @@ impl eframe::App for Designer1App {
                 if ui.button("Open JSON…").clicked() {
                     self.pick_and_load_json();
                 }
+                if ui.button("Open Folder…").clicked() {
+                    self.pick_and_load_folder();
+                }
                 if ui.button("Rebuild").clicked() {
                     self.rebuild_current();
                 }
                 if ui.button("Export SHV…").clicked() {
                     self.export_shv();
+                }
+                if ui.button("Generate Disk Files").clicked() {
+                    self.export_disk();
                 }
             });
         });
@@ -100,6 +115,11 @@ impl eframe::App for Designer1App {
                     .input_path
                     .as_ref()
                     .map(|p| p.display().to_string())
+                    .or_else(|| {
+                        self.disk_root
+                            .as_ref()
+                            .map(|p| format!("Disk root: {}", p.display()))
+                    })
                     .unwrap_or_else(|| "No file loaded".to_owned());
                 ui.monospace(input_text);
 
@@ -208,6 +228,22 @@ impl eframe::App for Designer1App {
                         });
                 }
 
+                if !self.disk_designs.is_empty() {
+                    ui.separator();
+                    ui.heading("Disk designs");
+                    let mut selected = None;
+                    for (idx, item) in self.disk_designs.iter().enumerate() {
+                        let is_selected = self.selected_disk_index == Some(idx);
+                        let label = format!("DES01_{:02} {}", item.slot, item.label);
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            selected = Some(idx);
+                        }
+                    }
+                    if let Some(idx) = selected {
+                        self.select_disk_design(idx);
+                    }
+                }
+
                 if let Some(report) = &self.report {
                     ui.separator();
                     ui.heading("SHV readback");
@@ -276,7 +312,16 @@ impl Designer1App {
             .pick_file()
         {
             self.input_path = Some(path);
+            self.disk_root = None;
+            self.disk_designs.clear();
+            self.selected_disk_index = None;
             self.rebuild_current();
+        }
+    }
+
+    fn pick_and_load_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.load_folder(path);
         }
     }
 
@@ -288,8 +333,32 @@ impl Designer1App {
         }
     }
 
+    fn disk_options(&self) -> DiskExportOptions {
+        DiskExportOptions {
+            signature: self.signature,
+            scale: self.scale,
+            center: self.center,
+            input_y_axis: self.input_y_axis,
+            disk_title: "Designer 1 Disk".to_owned(),
+            menu_label: "Menu 1".to_owned(),
+        }
+    }
+
     fn rebuild_current(&mut self) {
         self.error = None;
+        if let (Some(root), Some(idx)) = (self.disk_root.clone(), self.selected_disk_index) {
+            match load_disk_designs(&root, &self.disk_options()) {
+                Ok(designs) => {
+                    self.disk_designs = designs;
+                    self.select_disk_design(idx.min(self.disk_designs.len().saturating_sub(1)));
+                }
+                Err(err) => {
+                    self.error = Some(err.to_string());
+                    self.status = "Folder rebuild failed.".to_owned();
+                }
+            }
+            return;
+        }
         let Some(path) = self.input_path.clone() else {
             self.error = Some("No JSON file selected.".to_owned());
             return;
@@ -310,6 +379,51 @@ impl Designer1App {
         }
     }
 
+    fn load_folder(&mut self, path: PathBuf) {
+        self.error = None;
+        match load_disk_designs(&path, &self.disk_options()) {
+            Ok(designs) => {
+                self.input_path = None;
+                self.disk_root = Some(path);
+                self.disk_designs = designs;
+                self.selected_disk_index = None;
+                if !self.disk_designs.is_empty() {
+                    self.select_disk_design(0);
+                }
+                self.status = format!("Loaded {} disk design(s).", self.disk_designs.len());
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Folder load failed.".to_owned();
+                self.disk_root = None;
+                self.disk_designs.clear();
+                self.selected_disk_index = None;
+            }
+        }
+    }
+
+    fn select_disk_design(&mut self, idx: usize) {
+        self.error = None;
+        let Some(item) = self.disk_designs.get(idx) else {
+            self.error = Some("Selected disk design is out of range.".to_owned());
+            return;
+        };
+        let design = item.design.clone();
+        let slot = item.slot;
+        let label = item.label.clone();
+        match self.rebuild_from_design(design) {
+            Ok(()) => {
+                self.selected_disk_index = Some(idx);
+                self.name_override.clear();
+                self.status = format!("Selected DES01_{slot:02}: {label}");
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Preview build failed.".to_owned();
+            }
+        }
+    }
+
     fn rebuild_from_path(&mut self, path: &Path) -> anyhow::Result<()> {
         let mut design = load_inkstitch_json_file(path, &self.load_options())?;
         if self.name_override.trim().is_empty() {
@@ -318,6 +432,10 @@ impl Designer1App {
             design.name = self.name_override.trim().to_owned();
         }
 
+        self.rebuild_from_design(design)
+    }
+
+    fn rebuild_from_design(&mut self, design: Design) -> anyhow::Result<()> {
         let options = ShvOptions {
             name: None,
             signature: self.signature,
@@ -362,6 +480,27 @@ impl Designer1App {
                 Err(err) => {
                     self.error = Some(format!("Failed to write {}: {err}", path.display()));
                 }
+            }
+        }
+    }
+
+    fn export_disk(&mut self) {
+        self.error = None;
+        let Some(root) = self.disk_root.clone() else {
+            self.error = Some("Open a disk root folder first.".to_owned());
+            return;
+        };
+        match export_single_menu_disk(&root, &self.disk_options()) {
+            Ok(report) => {
+                self.status = format!(
+                    "Generated {} design(s) and {} disk file(s).",
+                    report.designs.len(),
+                    report.written_files.len()
+                );
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Disk export failed.".to_owned();
             }
         }
     }
