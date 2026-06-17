@@ -83,6 +83,14 @@ pub struct ImageInspection {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GotekDeviceCheck {
+    pub device: PathBuf,
+    pub size_bytes: u64,
+    pub slot_count: u64,
+    pub slot0_valid_fat12_1440: bool,
+}
+
 pub fn gotek_root() -> PathBuf {
     std::env::var_os("GOTEK_ROOT")
         .map(PathBuf::from)
@@ -231,6 +239,7 @@ pub fn verify_workspace_slots(
 
 pub fn write_slot(device: &Path, slot: u16, image: &Path) -> Result<SlotIoReport> {
     validate_slot(slot)?;
+    check_gotek_device_for_slot(device, slot)?;
     let data = fs::read(image).with_context(|| format!("reading {}", image.display()))?;
     if data.len() != FLOPPY_SIZE {
         bail!(
@@ -312,6 +321,50 @@ pub fn inspect_image(path: &Path) -> Result<ImageInspection> {
         label,
         files,
     })
+}
+
+pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
+    let mut file = File::open(device).with_context(|| format!("opening {}", device.display()))?;
+    let size_bytes = file
+        .metadata()
+        .with_context(|| format!("stat {}", device.display()))?
+        .len();
+    if size_bytes < FLOPPY_SIZE as u64 {
+        bail!(
+            "{} is {} bytes, smaller than one 1.44MB Gotek slot",
+            device.display(),
+            size_bytes
+        );
+    }
+    let mut slot0 = vec![0u8; FLOPPY_SIZE];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut slot0)?;
+    let slot0_valid_fat12_1440 = is_valid_fat12_1440(&slot0);
+    if !slot0_valid_fat12_1440 {
+        bail!(
+            "{} does not look like an initialized Gotek device: slot 0 is not a valid 1.44MB FAT12 floppy image",
+            device.display()
+        );
+    }
+    Ok(GotekDeviceCheck {
+        device: device.to_path_buf(),
+        size_bytes,
+        slot_count: size_bytes / FLOPPY_SIZE as u64,
+        slot0_valid_fat12_1440,
+    })
+}
+
+fn check_gotek_device_for_slot(device: &Path, slot: u16) -> Result<GotekDeviceCheck> {
+    let check = check_gotek_device(device)?;
+    let required = (slot as u64 + 1) * FLOPPY_SIZE as u64;
+    if check.size_bytes < required {
+        bail!(
+            "{} is {} bytes, but slot {slot} requires at least {required} bytes",
+            device.display(),
+            check.size_bytes
+        );
+    }
+    Ok(check)
 }
 
 fn pack_slot_dir(
@@ -1027,11 +1080,30 @@ mod tests {
         assert_eq!(report.slots[0].status, "packed");
 
         let bank = dir.join("bank.bin");
-        fs::write(&bank, vec![0u8; FLOPPY_SIZE * 3]).unwrap();
+        let mut bank_bytes = vec![0u8; FLOPPY_SIZE * 3];
+        let slot0 = build_fat12_image(&[], Some("GOTEK")).unwrap();
+        bank_bytes[..FLOPPY_SIZE].copy_from_slice(&slot0);
+        fs::write(&bank, bank_bytes).unwrap();
         let image = options.root.join("001").join(MANAGED_IMAGE);
         write_slot(&bank, 1, &image).unwrap();
         let verify = verify_slot(&bank, 1, &image).unwrap();
         assert!(verify.ok);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_rejects_uninitialized_bank() {
+        let dir = temp_dir("gotek_uninitialized");
+        let image = dir.join("slot.img");
+        let bank = dir.join("bank.bin");
+        fs::create_dir_all(&dir).unwrap();
+        create_blank_image(&image, Some("TEST")).unwrap();
+        fs::write(&bank, vec![0u8; FLOPPY_SIZE * 2]).unwrap();
+        let err = write_slot(&bank, 1, &image).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not look like an initialized Gotek device")
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

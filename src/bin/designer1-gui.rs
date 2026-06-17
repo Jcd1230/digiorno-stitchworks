@@ -585,7 +585,9 @@ impl Designer1App {
 
         let _ = fs::remove_file(&image);
         if let Err(err) = result {
-            self.error = Some(err.to_string());
+            self.error = Some(format!(
+                "{err}\n\nThe selected target does not look like an initialized Gotek device. Format or initialize it first, for example with `designer1-gotek mkimg` for a test bank slot or the CLI Gotek tooling for the real USB device, then try again."
+            ));
             self.status = "Gotek export failed.".to_owned();
         }
     }

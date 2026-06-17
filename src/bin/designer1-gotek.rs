@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use designer1_tools::gotek::{
-    GotekOptions, create_blank_image, init_workspace, inspect_image, pack_workspace, read_slot,
-    verify_slot, verify_workspace_slots, write_slot, write_workspace_slots,
+    GotekOptions, check_gotek_device, create_blank_image, init_workspace, inspect_image,
+    pack_workspace, read_slot, verify_slot, verify_workspace_slots, write_slot,
+    write_workspace_slots,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -36,6 +37,10 @@ fn main() -> Result<()> {
         }
         Command::InspectImage(args) => {
             let report = inspect_image(&args.image)?;
+            print_report(cli.json, &report)
+        }
+        Command::CheckDevice(args) => {
+            let report = check_gotek_device(&args.device)?;
             print_report(cli.json, &report)
         }
         Command::ReadSlot(args) => {
@@ -113,6 +118,8 @@ enum Command {
     Pack(RootArgs),
     /// Inspect a 1.44MB FAT12 floppy image.
     InspectImage(InspectImageArgs),
+    /// Check whether a raw device or bank file looks like initialized Gotek media.
+    CheckDevice(DeviceArgs),
     /// Read one fixed Gotek slot from a raw device or bank file.
     ReadSlot(ReadSlotArgs),
     /// Write one 1.44MB image to one fixed Gotek slot.
@@ -143,6 +150,11 @@ struct MkimgArgs {
 #[derive(Debug, Args)]
 struct InspectImageArgs {
     image: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DeviceArgs {
+    device: PathBuf,
 }
 
 #[derive(Debug, Args)]
