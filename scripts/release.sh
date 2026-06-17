@@ -8,6 +8,7 @@ fi
 
 version="$1"
 tag="v${version}"
+commit_id="$(jj log -r @ --no-graph -T 'commit_id')"
 
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   echo "invalid version: $version" >&2
@@ -46,7 +47,6 @@ if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
   exit 1
 fi
 
-commit_id="$(jj log -r @ --no-graph -T 'commit_id')"
 git tag "$tag" "$commit_id"
 git push origin "$tag"
 
