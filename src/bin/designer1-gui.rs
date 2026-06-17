@@ -8,10 +8,13 @@ use designer1_tools::preview::render_preview_4bpp;
 use designer1_tools::shv::{ShvOptions, ShvReadbackReport, build_shv, validate_generated_shv};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const PREVIEW_WIDTH: u8 = 96;
 const PREVIEW_HEIGHT: u8 = 24;
+const SETTINGS_DIR: &str = "designer1-rs";
+const SETTINGS_FILE: &str = "gui.toml";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -24,7 +27,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Designer 1 SHV Converter",
         options,
-        Box::new(|_cc| Ok(Box::new(Designer1App::default()))),
+        Box::new(|_cc| Ok(Box::new(Designer1App::new()))),
     )
 }
 
@@ -48,6 +51,7 @@ struct Designer1App {
     path_zoom: f32,
     path_pan: Vec2,
     show_mhv_preview: bool,
+    last_open_dir: PathBuf,
 
     status: String,
     error: Option<String>,
@@ -74,6 +78,7 @@ impl Default for Designer1App {
             path_zoom: 1.0,
             path_pan: Vec2::ZERO,
             show_mhv_preview: false,
+            last_open_dir: initial_open_dir(),
             status: "Load an Ink/Stitch JSON file to begin.".to_owned(),
             error: None,
         }
@@ -281,11 +286,22 @@ impl eframe::App for Designer1App {
 }
 
 impl Designer1App {
+    fn new() -> Self {
+        let mut app = Self::default();
+        if let Some(path) = load_last_open_dir().filter(|path| path.is_dir()) {
+            app.last_open_dir = path.clone();
+            app.load_folder(path);
+        }
+        app
+    }
+
     fn pick_and_load_json(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
             .add_filter("Ink/Stitch JSON", &["json"])
             .pick_file()
         {
+            self.remember_open_dir(path.parent().unwrap_or(&path));
             self.input_path = Some(path);
             self.disk_root = None;
             self.disk_designs.clear();
@@ -295,7 +311,10 @@ impl Designer1App {
     }
 
     fn pick_and_load_folder(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
+            .pick_folder()
+        {
             self.load_folder(path);
         }
     }
@@ -358,6 +377,7 @@ impl Designer1App {
         self.error = None;
         match load_disk_designs(&path, &self.disk_options()) {
             Ok(designs) => {
+                self.remember_open_dir(&path);
                 self.input_path = None;
                 self.disk_root = Some(path);
                 self.disk_designs = designs;
@@ -439,6 +459,7 @@ impl Designer1App {
             format!("{}.SHV", self.name_override.trim().to_ascii_uppercase())
         };
         if let Some(mut path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
             .add_filter("Husqvarna SHV", &["shv", "SHV"])
             .set_file_name(&default_name)
             .save_file()
@@ -449,6 +470,9 @@ impl Designer1App {
             let bytes = self.shv_bytes.as_ref().unwrap();
             match std::fs::write(&path, bytes) {
                 Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        self.remember_open_dir(parent);
+                    }
                     self.status = format!("Exported {}", path.display());
                     self.error = None;
                 }
@@ -506,6 +530,95 @@ impl Designer1App {
                 }
             });
     }
+
+    fn remember_open_dir(&mut self, path: &Path) {
+        if path.is_dir() {
+            self.last_open_dir = path.to_path_buf();
+            let _ = save_last_open_dir(path);
+        }
+    }
+}
+
+fn initial_open_dir() -> PathBuf {
+    load_last_open_dir()
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("cache"))
+        })?;
+    Some(cache_home.join(SETTINGS_DIR).join(SETTINGS_FILE))
+}
+
+fn load_last_open_dir() -> Option<PathBuf> {
+    let contents = fs::read_to_string(settings_path()?).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("last_open_dir") else {
+            continue;
+        };
+        let Some(value) = value.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = parse_toml_string(value.trim())?;
+        return Some(PathBuf::from(value));
+    }
+    None
+}
+
+fn save_last_open_dir(path: &Path) -> std::io::Result<()> {
+    let Some(settings_path) = settings_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        settings_path,
+        format!(
+            "last_open_dir = \"{}\"\n",
+            escape_toml_string(&path.display().to_string())
+        ),
+    )
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            out.push(match ch {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+fn escape_toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn draw_design_path(
@@ -959,5 +1072,17 @@ fn thumbnail_pixel_bounds(
         ))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_path_string_round_trips_quotes_and_backslashes() {
+        let path = r#"/tmp/designer "one"\folder"#;
+        let encoded = format!("\"{}\"", escape_toml_string(path));
+        assert_eq!(parse_toml_string(&encoded).as_deref(), Some(path));
     }
 }
