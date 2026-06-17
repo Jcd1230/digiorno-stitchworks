@@ -1,5 +1,6 @@
 use designer1_tools::disk::{
-    DiskDesignInput, DiskExportOptions, export_single_menu_disk, load_disk_designs,
+    DiskDesignInput, DiskExportOptions, MHV_PREVIEW_HEIGHT, MHV_PREVIEW_WIDTH,
+    export_single_menu_disk, load_disk_designs, render_mhv_preview_pixels,
 };
 use designer1_tools::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use designer1_tools::model::{Design, InputYAxis, SignatureMode, StitchCommand};
@@ -46,6 +47,7 @@ struct Designer1App {
     show_jumps: bool,
     path_zoom: f32,
     path_pan: Vec2,
+    show_mhv_preview: bool,
 
     status: String,
     error: Option<String>,
@@ -71,6 +73,7 @@ impl Default for Designer1App {
             show_jumps: true,
             path_zoom: 1.0,
             path_pan: Vec2::ZERO,
+            show_mhv_preview: false,
             status: "Load an Ink/Stitch JSON file to begin.".to_owned(),
             error: None,
         }
@@ -100,8 +103,19 @@ impl eframe::App for Designer1App {
                 if ui.button("Generate Disk Files").clicked() {
                     self.export_disk();
                 }
+                if ui
+                    .add_enabled(
+                        !self.disk_designs.is_empty(),
+                        egui::Button::new("MHV Preview"),
+                    )
+                    .clicked()
+                {
+                    self.show_mhv_preview = true;
+                }
             });
         });
+
+        self.show_mhv_preview_window(ctx);
 
         egui::SidePanel::left("options")
             .resizable(true)
@@ -212,6 +226,9 @@ impl eframe::App for Designer1App {
                 if !self.disk_designs.is_empty() {
                     ui.separator();
                     ui.heading("Disk designs");
+                    if ui.button("MHV Preview").clicked() {
+                        self.show_mhv_preview = true;
+                    }
                     let mut selected = None;
                     for (idx, item) in self.disk_designs.iter().enumerate() {
                         let is_selected = self.selected_disk_index == Some(idx);
@@ -462,6 +479,33 @@ impl Designer1App {
             }
         }
     }
+
+    fn show_mhv_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.show_mhv_preview {
+            return;
+        }
+
+        egui::Window::new("MENU_01.MHV Preview")
+            .open(&mut self.show_mhv_preview)
+            .default_size(Vec2::new(560.0, 620.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                if self.disk_designs.is_empty() {
+                    ui.label("Open a folder to preview MENU_01.MHV.");
+                    return;
+                }
+
+                match render_mhv_preview_pixels(&self.disk_designs) {
+                    Ok(pixels) => draw_mhv_preview(ui, &pixels),
+                    Err(err) => {
+                        ui.colored_label(
+                            Color32::from_rgb(190, 40, 40),
+                            format!("Failed to render MHV preview: {err}"),
+                        );
+                    }
+                }
+            });
+    }
 }
 
 fn draw_design_path(
@@ -686,6 +730,44 @@ fn parse_hex_color(value: Option<&str>) -> Option<Color32> {
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some(Color32::from_rgb(r, g, b))
+}
+
+fn draw_mhv_preview(ui: &mut egui::Ui, pixels: &[u8]) {
+    let native = Vec2::new(MHV_PREVIEW_WIDTH as f32, MHV_PREVIEW_HEIGHT as f32);
+    let available = ui.available_size().max(Vec2::new(160.0, 160.0));
+    let scale = (available.x / native.x)
+        .min(available.y / native.y)
+        .max(0.25);
+    let desired = native * scale;
+    let (rect, _response) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_gray(245));
+
+    let sx = rect.width() / MHV_PREVIEW_WIDTH as f32;
+    let sy = rect.height() / MHV_PREVIEW_HEIGHT as f32;
+    for y in 0..MHV_PREVIEW_HEIGHT {
+        for x in 0..MHV_PREVIEW_WIDTH {
+            let value = pixels[y * MHV_PREVIEW_WIDTH + x];
+            if value == 0 {
+                continue;
+            }
+            let color = mhv_preview_color(value);
+            let cell = Rect::from_min_size(
+                Pos2::new(rect.left() + x as f32 * sx, rect.top() + y as f32 * sy),
+                Vec2::new(sx.max(1.0), sy.max(1.0)),
+            );
+            painter.rect_filled(cell, 0.0, color);
+        }
+    }
+}
+
+fn mhv_preview_color(value: u8) -> Color32 {
+    match value {
+        0x5 => Color32::from_rgb(0, 190, 210),
+        0x7 => Color32::from_rgb(0, 210, 210),
+        0x0f => Color32::from_rgb(30, 70, 190),
+        _ => Color32::from_gray(30),
+    }
 }
 
 fn draw_thread_thumbnail(ui: &mut egui::Ui, design: &Design, width: usize, height: usize) {

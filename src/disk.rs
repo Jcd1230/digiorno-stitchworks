@@ -32,6 +32,9 @@ const MHV_GRID_THUMB_H: usize = 72;
 const MHV_GRID_LINE_VALUE: u8 = 0x5;
 const MHV_THUMB_VALUE: u8 = 0x0f;
 
+pub const MHV_PREVIEW_WIDTH: usize = MHV_SCREEN_WIDTH;
+pub const MHV_PREVIEW_HEIGHT: usize = MHV_SCREEN_HEIGHT;
+
 #[derive(Debug, Clone)]
 pub struct DiskExportOptions {
     pub signature: SignatureMode,
@@ -364,7 +367,7 @@ fn render_text_bitmap(
     pack_4bpp(&pixels, width, height)
 }
 
-fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
+pub fn render_mhv_preview_pixels(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
     let mut pixels = vec![0u8; MHV_SCREEN_WIDTH * MHV_SCREEN_HEIGHT];
     draw_mhv_grid(&mut pixels);
 
@@ -399,6 +402,11 @@ fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
         );
     }
 
+    Ok(pixels)
+}
+
+fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
+    let pixels = render_mhv_preview_pixels(designs)?;
     let rotated = rotate_clockwise(&pixels, MHV_SCREEN_WIDTH, MHV_SCREEN_HEIGHT);
     Ok(pack_4bpp(&rotated, MHV_BITMAP_WIDTH, MHV_BITMAP_HEIGHT))
 }
