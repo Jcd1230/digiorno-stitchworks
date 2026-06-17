@@ -2,6 +2,7 @@ use designer1_tools::disk::{
     DiskDesignInput, DiskExportOptions, MHV_PREVIEW_HEIGHT, MHV_PREVIEW_PALETTE, MHV_PREVIEW_WIDTH,
     export_single_menu_disk, load_disk_designs, render_mhv_preview_pixels,
 };
+use designer1_tools::gotek::{create_designer_disk_image, verify_slot, write_slot};
 use designer1_tools::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use designer1_tools::model::{Design, InputYAxis, SignatureMode, StitchCommand};
 use designer1_tools::preview::render_preview_4bpp;
@@ -52,6 +53,8 @@ struct Designer1App {
     path_pan: Vec2,
     show_mhv_preview: bool,
     last_open_dir: PathBuf,
+    gotek_device_path: String,
+    gotek_slot: u16,
 
     status: String,
     error: Option<String>,
@@ -79,6 +82,8 @@ impl Default for Designer1App {
             path_pan: Vec2::ZERO,
             show_mhv_preview: false,
             last_open_dir: initial_open_dir(),
+            gotek_device_path: String::new(),
+            gotek_slot: 1,
             status: "Load an Ink/Stitch JSON file to begin.".to_owned(),
             error: None,
         }
@@ -107,6 +112,15 @@ impl eframe::App for Designer1App {
                 }
                 if ui.button("Generate Disk Files").clicked() {
                     self.export_disk();
+                }
+                if ui
+                    .add_enabled(
+                        self.disk_root.is_some(),
+                        egui::Button::new("Export To Gotek Slot"),
+                    )
+                    .clicked()
+                {
+                    self.export_to_gotek_slot();
                 }
                 if ui
                     .add_enabled(
@@ -244,6 +258,25 @@ impl eframe::App for Designer1App {
                     }
                     if let Some(idx) = selected {
                         self.select_disk_design(idx);
+                    }
+                }
+
+                if self.disk_root.is_some() {
+                    ui.separator();
+                    ui.heading("Gotek");
+                    ui.label("Device or bank file");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.gotek_device_path);
+                        if ui.button("Browse…").clicked() {
+                            self.pick_gotek_device_file();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Slot");
+                        ui.add(egui::DragValue::new(&mut self.gotek_slot).range(0..=999));
+                    });
+                    if ui.button("Export To Gotek Slot").clicked() {
+                        self.export_to_gotek_slot();
                     }
                 }
 
@@ -504,6 +537,59 @@ impl Designer1App {
         }
     }
 
+    fn pick_gotek_device_file(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
+            .pick_file()
+        {
+            if let Some(parent) = path.parent() {
+                self.remember_open_dir(parent);
+            }
+            self.gotek_device_path = path.display().to_string();
+        }
+    }
+
+    fn export_to_gotek_slot(&mut self) {
+        self.error = None;
+        let Some(root) = self.disk_root.clone() else {
+            self.error = Some("Open a disk root folder first.".to_owned());
+            return;
+        };
+        if self.gotek_device_path.trim().is_empty() {
+            self.error = Some("Enter a Gotek device path or bank file.".to_owned());
+            return;
+        }
+        let device = PathBuf::from(self.gotek_device_path.trim());
+        let slot = self.gotek_slot;
+        let image = temp_gotek_image_path(slot);
+
+        let result = (|| -> anyhow::Result<()> {
+            let export = export_single_menu_disk(&root, &self.disk_options())?;
+            create_designer_disk_image(&root, &image, Some("DESIGNER1"))?;
+            let write = write_slot(&device, slot, &image)?;
+            let verify = verify_slot(&device, slot, &image)?;
+            if !verify.ok {
+                anyhow::bail!(
+                    "Gotek slot verification failed: local {} device {}",
+                    verify.local_sha256,
+                    verify.device_sha256
+                );
+            }
+            self.status = format!(
+                "Exported {} design(s), wrote {} bytes to slot {slot:03}, and verified.",
+                export.designs.len(),
+                write.bytes
+            );
+            Ok(())
+        })();
+
+        let _ = fs::remove_file(&image);
+        if let Err(err) = result {
+            self.error = Some(err.to_string());
+            self.status = "Gotek export failed.".to_owned();
+        }
+    }
+
     fn show_mhv_preview_window(&mut self, ctx: &egui::Context) {
         if !self.show_mhv_preview {
             return;
@@ -619,6 +705,17 @@ fn parse_toml_string(value: &str) -> Option<String> {
 
 fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn temp_gotek_image_path(slot: u16) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "designer1-gotek-slot-{slot:03}-{}-{nonce}.img",
+        std::process::id()
+    ))
 }
 
 fn draw_design_path(

@@ -118,6 +118,32 @@ pub fn create_blank_image(path: &Path, label: Option<&str>) -> Result<()> {
     fs::write(path, image).with_context(|| format!("writing {}", path.display()))
 }
 
+pub fn create_designer_disk_image(root: &Path, output: &Path, label: Option<&str>) -> Result<()> {
+    let menu_sel = root.join("MENU_SEL.PHV");
+    let menu_dir = root.join("MENU_01");
+    if !menu_sel.is_file() {
+        bail!(
+            "{} does not exist; generate disk files first",
+            menu_sel.display()
+        );
+    }
+    if !menu_dir.is_dir() {
+        bail!(
+            "{} does not exist; generate disk files first",
+            menu_dir.display()
+        );
+    }
+
+    let mut entries = Vec::new();
+    collect_image_entries(root, &menu_sel, &mut entries)?;
+    collect_image_entries(root, &menu_dir, &mut entries)?;
+    let image = build_fat12_image(&entries, label)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(output, image).with_context(|| format!("writing {}", output.display()))
+}
+
 pub fn pack_workspace(options: &GotekOptions) -> Result<PackReport> {
     fs::create_dir_all(&options.root)
         .with_context(|| format!("creating {}", options.root.display()))?;
@@ -1006,6 +1032,22 @@ mod tests {
         write_slot(&bank, 1, &image).unwrap();
         let verify = verify_slot(&bank, 1, &image).unwrap();
         assert!(verify.ok);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn creates_designer_disk_image_from_generated_layout() {
+        let dir = temp_dir("designer_disk_image");
+        fs::create_dir_all(dir.join("disk/MENU_01")).unwrap();
+        fs::write(dir.join("disk/MENU_SEL.PHV"), b"root").unwrap();
+        fs::write(dir.join("disk/MENU_01/MENU_01.MHV"), b"menu").unwrap();
+        fs::write(dir.join("disk/MENU_01/DES01_01.SHV"), b"design").unwrap();
+        let image = dir.join("slot.img");
+        create_designer_disk_image(&dir.join("disk"), &image, Some("DESIGNER1")).unwrap();
+        let inspected = inspect_image(&image).unwrap();
+        assert!(inspected.valid_fat12_1440);
+        assert!(inspected.files.contains(&"MENU_SEL.PHV".to_owned()));
+        assert!(inspected.files.contains(&"MENU_01".to_owned()));
         fs::remove_dir_all(dir).unwrap();
     }
 
