@@ -4,6 +4,8 @@ Rust tools for working with Husqvarna/Viking Designer 1 embroidery media.
 
 This project focuses on practical interoperability with real Designer 1 hardware. It can load and normalize Ink/Stitch JSON exports, write Designer 1 `SHV` design files, build `PHV`/`MHV` menu assets, assemble FAT12 floppy images, and manage Gotek slot images from both a CLI and a desktop GUI.
 
+![Designer 1 GUI screenshot](docs/screenshot.png)
+
 ## Features
 
 - Convert Ink/Stitch JSON into Designer 1 `SHV` files.
