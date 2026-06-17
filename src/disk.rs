@@ -21,10 +21,12 @@ const PHV_BITMAP_OFFSET: usize = 0x04fb;
 const MHV_BITMAP_WIDTH: usize = 244;
 const MHV_BITMAP_HEIGHT: usize = 238;
 const MHV_BITMAP_OFFSET: usize = 0x013f;
+const MHV_SCREEN_WIDTH: usize = MHV_BITMAP_HEIGHT;
+const MHV_SCREEN_HEIGHT: usize = MHV_BITMAP_WIDTH;
 const MHV_GRID_COLS: usize = 3;
 const MHV_GRID_ROWS: usize = 2;
-const MHV_GRID_CELL_W: usize = MHV_BITMAP_WIDTH / MHV_GRID_COLS;
-const MHV_GRID_CELL_H: usize = MHV_BITMAP_HEIGHT / MHV_GRID_ROWS;
+const MHV_GRID_CELL_W: usize = MHV_SCREEN_WIDTH / MHV_GRID_COLS;
+const MHV_GRID_CELL_H: usize = MHV_SCREEN_HEIGHT / MHV_GRID_ROWS;
 const MHV_GRID_THUMB_W: usize = 72;
 const MHV_GRID_THUMB_H: usize = 72;
 const MHV_GRID_LINE_VALUE: u8 = 0x5;
@@ -363,7 +365,7 @@ fn render_text_bitmap(
 }
 
 fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
-    let mut pixels = vec![0u8; MHV_BITMAP_WIDTH * MHV_BITMAP_HEIGHT];
+    let mut pixels = vec![0u8; MHV_SCREEN_WIDTH * MHV_SCREEN_HEIGHT];
     draw_mhv_grid(&mut pixels);
 
     for (idx, design) in designs.iter().take(MAX_MENU_DESIGNS).enumerate() {
@@ -380,16 +382,16 @@ fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
         blit_thumb_4bpp(
             &mut pixels,
             cell_x + (MHV_GRID_CELL_W - MHV_GRID_THUMB_W) / 2,
-            cell_y + 12,
+            cell_y + (MHV_GRID_CELL_H - MHV_GRID_THUMB_H) / 2,
             MHV_GRID_THUMB_W,
             MHV_GRID_THUMB_H,
             &thumb,
         );
-        let label = format!("{:02}", design.slot);
+        let label = design.slot.to_string();
         draw_text(
             &mut pixels,
-            MHV_BITMAP_WIDTH,
-            MHV_BITMAP_HEIGHT,
+            MHV_SCREEN_WIDTH,
+            MHV_SCREEN_HEIGHT,
             cell_x + 6,
             cell_y + MHV_GRID_CELL_H - 14,
             &label,
@@ -397,20 +399,21 @@ fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
         );
     }
 
-    Ok(pack_4bpp(&pixels, MHV_BITMAP_WIDTH, MHV_BITMAP_HEIGHT))
+    let rotated = rotate_clockwise(&pixels, MHV_SCREEN_WIDTH, MHV_SCREEN_HEIGHT);
+    Ok(pack_4bpp(&rotated, MHV_BITMAP_WIDTH, MHV_BITMAP_HEIGHT))
 }
 
 fn draw_mhv_grid(pixels: &mut [u8]) {
     for row in 1..MHV_GRID_ROWS {
         let y = row * MHV_GRID_CELL_H;
-        for x in 0..MHV_BITMAP_WIDTH {
-            pixels[y * MHV_BITMAP_WIDTH + x] = MHV_GRID_LINE_VALUE;
+        for x in 0..MHV_SCREEN_WIDTH {
+            pixels[y * MHV_SCREEN_WIDTH + x] = MHV_GRID_LINE_VALUE;
         }
     }
     for col in 1..MHV_GRID_COLS {
         let x = col * MHV_GRID_CELL_W;
-        for y in 0..MHV_BITMAP_HEIGHT {
-            pixels[y * MHV_BITMAP_WIDTH + x] = MHV_GRID_LINE_VALUE;
+        for y in 0..MHV_SCREEN_HEIGHT {
+            pixels[y * MHV_SCREEN_WIDTH + x] = MHV_GRID_LINE_VALUE;
         }
     }
 }
@@ -433,11 +436,23 @@ fn blit_thumb_4bpp(
             }
             let px = dst_x + x;
             let py = dst_y + y;
-            if px < MHV_BITMAP_WIDTH && py < MHV_BITMAP_HEIGHT {
-                dest[py * MHV_BITMAP_WIDTH + px] = value;
+            if px < MHV_SCREEN_WIDTH && py < MHV_SCREEN_HEIGHT {
+                dest[py * MHV_SCREEN_WIDTH + px] = value;
             }
         }
     }
+}
+
+fn rotate_clockwise(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; pixels.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let dst_x = height - 1 - y;
+            let dst_y = x;
+            out[dst_y * height + dst_x] = pixels[y * width + x];
+        }
+    }
+    out
 }
 
 fn draw_text(
@@ -560,10 +575,7 @@ mod tests {
         let options = DiskExportOptions::default();
         let mhv = build_mhv(
             &options,
-            &[
-                sample_disk_design(1, "One"),
-                sample_disk_design(2, "Two"),
-            ],
+            &[sample_disk_design(1, "One"), sample_disk_design(2, "Two")],
         )
         .unwrap();
         assert_eq!(
