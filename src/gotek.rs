@@ -6,12 +6,15 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FLOPPY_SIZE: usize = 1_474_560;
 pub const SLOT_COUNT: u16 = 1000;
 pub const MANAGED_IMAGE: &str = ".floppy.img";
 pub const MANAGED_HASH: &str = ".floppy.hash";
 pub const WRITTEN_HASH: &str = ".floppy.written.hash";
+const SLOT_PADDING: usize = 98_304;
+const SLOT_STRIDE: usize = FLOPPY_SIZE + SLOT_PADDING;
 
 const BYTES_PER_SECTOR: usize = 512;
 const SECTORS_PER_CLUSTER: u8 = 1;
@@ -86,9 +89,17 @@ pub struct ImageInspection {
 #[derive(Debug, Clone, Serialize)]
 pub struct GotekDeviceCheck {
     pub device: PathBuf,
-    pub size_bytes: u64,
-    pub slot_count: u64,
+    pub size_bytes: Option<u64>,
+    pub slot_count: Option<u64>,
+    pub is_regular_file: bool,
     pub slot0_valid_fat12_1440: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GotekDeviceCandidate {
+    pub path: PathBuf,
+    pub label: String,
+    pub check: GotekDeviceCheck,
 }
 
 pub fn gotek_root() -> PathBuf {
@@ -126,25 +137,60 @@ pub fn create_blank_image(path: &Path, label: Option<&str>) -> Result<()> {
     fs::write(path, image).with_context(|| format!("writing {}", path.display()))
 }
 
-pub fn create_designer_disk_image(root: &Path, output: &Path, label: Option<&str>) -> Result<()> {
-    let menu_sel = root.join("MENU_SEL.PHV");
-    let menu_dir = root.join("MENU_01");
-    if !menu_sel.is_file() {
-        bail!(
-            "{} does not exist; generate disk files first",
-            menu_sel.display()
-        );
+pub fn create_designer_disk_image(
+    root: &Path,
+    paths: &[PathBuf],
+    output: &Path,
+    label: Option<&str>,
+) -> Result<()> {
+    if paths.is_empty() {
+        bail!("no disk files were provided; generate disk files first");
     }
-    if !menu_dir.is_dir() {
-        bail!(
-            "{} does not exist; generate disk files first",
-            menu_dir.display()
-        );
-    }
-
     let mut entries = Vec::new();
-    collect_image_entries(root, &menu_sel, &mut entries)?;
-    collect_image_entries(root, &menu_dir, &mut entries)?;
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        let rel = path
+            .strip_prefix(root)
+            .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
+        let mut current = rel.parent();
+        let mut ancestors = Vec::new();
+        while let Some(parent) = current {
+            if !parent.as_os_str().is_empty() {
+                ancestors.push(root.join(parent));
+            }
+            current = parent.parent();
+        }
+        ancestors.reverse();
+        for ancestor in ancestors {
+            if seen.insert(ancestor.clone()) {
+                candidates.push(ancestor);
+            }
+        }
+        if seen.insert(path.clone()) {
+            candidates.push(path.clone());
+        }
+    }
+    candidates.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+    let mut roots = Vec::new();
+    'outer: for candidate in candidates {
+        for existing in &roots {
+            if candidate.starts_with(existing) {
+                continue 'outer;
+            }
+        }
+        roots.push(candidate);
+    }
+    for entry in roots {
+        let rel = entry
+            .strip_prefix(root)
+            .with_context(|| format!("{} is not under {}", entry.display(), root.display()))?;
+        let base = rel.file_name().and_then(OsStr::to_str).unwrap_or("");
+        if base.starts_with('.') || rel.as_os_str().is_empty() {
+            continue;
+        }
+        collect_image_entries(root, &entry, &mut entries)?;
+    }
     let image = build_fat12_image(&entries, label)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -257,6 +303,8 @@ pub fn write_slot(device: &Path, slot: u16, image: &Path) -> Result<SlotIoReport
     let offset = slot_offset(slot);
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(&data)?;
+    // FlashFloppy's Gotek image collection leaves a 96 KiB zero-filled pad after each 1.44MB slot.
+    file.write_all(&vec![0u8; SLOT_PADDING])?;
     file.flush()?;
     Ok(SlotIoReport {
         slot,
@@ -325,15 +373,16 @@ pub fn inspect_image(path: &Path) -> Result<ImageInspection> {
 
 pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
     let mut file = File::open(device).with_context(|| format!("opening {}", device.display()))?;
-    let size_bytes = file
+    let metadata = file
         .metadata()
-        .with_context(|| format!("stat {}", device.display()))?
-        .len();
-    if size_bytes < FLOPPY_SIZE as u64 {
+        .with_context(|| format!("stat {}", device.display()))?;
+    let is_regular_file = metadata.is_file();
+    let size_bytes = (metadata.len() > 0).then_some(metadata.len());
+    if is_regular_file && size_bytes.unwrap_or(0) < FLOPPY_SIZE as u64 {
         bail!(
             "{} is {} bytes, smaller than one 1.44MB Gotek slot",
             device.display(),
-            size_bytes
+            size_bytes.unwrap_or(0)
         );
     }
     let mut slot0 = vec![0u8; FLOPPY_SIZE];
@@ -349,7 +398,8 @@ pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
     Ok(GotekDeviceCheck {
         device: device.to_path_buf(),
         size_bytes,
-        slot_count: size_bytes / FLOPPY_SIZE as u64,
+        slot_count: size_bytes.map(|size| size / FLOPPY_SIZE as u64),
+        is_regular_file,
         slot0_valid_fat12_1440,
     })
 }
@@ -357,14 +407,61 @@ pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
 fn check_gotek_device_for_slot(device: &Path, slot: u16) -> Result<GotekDeviceCheck> {
     let check = check_gotek_device(device)?;
     let required = (slot as u64 + 1) * FLOPPY_SIZE as u64;
-    if check.size_bytes < required {
+    if check.is_regular_file && check.size_bytes.unwrap_or(0) < required {
         bail!(
             "{} is {} bytes, but slot {slot} requires at least {required} bytes",
             device.display(),
-            check.size_bytes
+            check.size_bytes.unwrap_or(0)
         );
     }
     Ok(check)
+}
+
+pub fn list_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
+    platform_gotek_device_candidates()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
+    let mut candidates = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/block") else {
+        return candidates;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("loop") || name.starts_with("ram") {
+            continue;
+        }
+        let path = PathBuf::from("/dev").join(&name);
+        let Ok(check) = check_gotek_device(&path) else {
+            continue;
+        };
+        let removable = fs::read_to_string(entry.path().join("removable"))
+            .ok()
+            .is_some_and(|value| value.trim() == "1");
+        let model = fs::read_to_string(entry.path().join("device/model"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let size = check
+            .slot_count
+            .map(|slots| format!("{slots} slot(s)"))
+            .unwrap_or_else(|| "raw block device".to_owned());
+        let label = match (removable, model) {
+            (true, Some(model)) => format!("{} - {} ({size})", path.display(), model),
+            (true, None) => format!("{} - removable ({size})", path.display()),
+            (false, Some(model)) => format!("{} - {} ({size})", path.display(), model),
+            (false, None) => format!("{} ({size})", path.display()),
+        };
+        candidates.push(GotekDeviceCandidate { path, label, check });
+    }
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    candidates
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
+    Vec::new()
 }
 
 fn pack_slot_dir(
@@ -444,22 +541,24 @@ struct ImageEntry {
     image_path: String,
     source: PathBuf,
     is_dir: bool,
+    timestamp: FatTimestamp,
 }
 
 fn collect_image_entries(base: &Path, entry: &Path, out: &mut Vec<ImageEntry>) -> Result<()> {
     let rel = entry.strip_prefix(base).unwrap_or(entry);
     let image_path = path_to_image_path(rel)?;
     let meta = fs::metadata(entry).with_context(|| format!("stat {}", entry.display()))?;
+    let timestamp = FatTimestamp::from_system_time(meta.modified().ok());
     if meta.is_dir() {
         out.push(ImageEntry {
             image_path: image_path.clone(),
             source: entry.to_path_buf(),
             is_dir: true,
+            timestamp,
         });
-        let mut children = fs::read_dir(entry)?
+        let children = fs::read_dir(entry)?
             .map(|item| item.map(|e| e.path()))
             .collect::<std::io::Result<Vec<_>>>()?;
-        children.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
         for child in children {
             collect_image_entries(base, &child, out)?;
         }
@@ -468,6 +567,7 @@ fn collect_image_entries(base: &Path, entry: &Path, out: &mut Vec<ImageEntry>) -
             image_path,
             source: entry.to_path_buf(),
             is_dir: false,
+            timestamp,
         });
     }
     Ok(())
@@ -478,15 +578,15 @@ fn build_fat12_image(entries: &[ImageEntry], label: Option<&str>) -> Result<Vec<
     write_boot_sector(&mut image, label);
     let mut builder = FatBuilder::new(image);
     if let Some(label) = label.and_then(volume_label_11) {
-        builder.add_volume_label(&label)?;
+        builder.add_volume_label(&label, FatTimestamp::now())?;
     }
     for entry in entries {
         if entry.is_dir {
-            builder.add_dir(&entry.image_path)?;
+            builder.add_dir(&entry.image_path, entry.timestamp)?;
         } else {
             let data = fs::read(&entry.source)
                 .with_context(|| format!("reading {}", entry.source.display()))?;
-            builder.add_file(&entry.image_path, &data)?;
+            builder.add_file(&entry.image_path, &data, entry.timestamp)?;
         }
     }
     builder.finish()
@@ -519,29 +619,35 @@ impl FatBuilder {
         Ok(self.image)
     }
 
-    fn add_volume_label(&mut self, label: &[u8; 11]) -> Result<()> {
+    fn add_volume_label(&mut self, label: &[u8; 11], timestamp: FatTimestamp) -> Result<()> {
         let mut entry = [0u8; 32];
         entry[0..11].copy_from_slice(label);
         entry[11] = 0x08;
+        timestamp.write_to_dir_entry(&mut entry);
         self.write_dir_entry(None, &entry)
     }
 
-    fn add_dir(&mut self, path: &str) -> Result<()> {
+    fn add_dir(&mut self, path: &str, timestamp: FatTimestamp) -> Result<()> {
         let (parent, name) = split_image_path(path);
         if self.dirs.contains_key(path) {
             return Ok(());
         }
         let cluster = self.alloc_chain(1)?;
         self.zero_cluster(cluster);
+        let parent_cluster = parent
+            .and_then(|parent| self.dirs.get(parent).copied())
+            .unwrap_or(0);
+        self.init_dir_cluster(cluster, parent_cluster, timestamp);
         self.dirs.insert(path.to_owned(), cluster);
         let mut entry = [0u8; 32];
         entry[0..11].copy_from_slice(&short_name_11(name)?);
         entry[11] = 0x10;
+        timestamp.write_to_dir_entry(&mut entry);
         write_u16(&mut entry[26..28], cluster);
         self.write_dir_entry(parent, &entry)
     }
 
-    fn add_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+    fn add_file(&mut self, path: &str, data: &[u8], timestamp: FatTimestamp) -> Result<()> {
         let (parent, name) = split_image_path(path);
         let clusters_needed = data.len().div_ceil(BYTES_PER_SECTOR).max(1);
         let first_cluster = self.alloc_chain(clusters_needed)?;
@@ -553,6 +659,7 @@ impl FatBuilder {
         let mut entry = [0u8; 32];
         entry[0..11].copy_from_slice(&short_name_11(name)?);
         entry[11] = 0x20;
+        timestamp.write_to_dir_entry(&mut entry);
         write_u16(&mut entry[26..28], first_cluster);
         write_u32(&mut entry[28..32], data.len() as u32);
         self.write_dir_entry(parent, &entry)
@@ -592,6 +699,24 @@ impl FatBuilder {
         self.image[offset..offset + BYTES_PER_SECTOR].fill(0);
     }
 
+    fn init_dir_cluster(&mut self, cluster: u16, parent_cluster: u16, timestamp: FatTimestamp) {
+        let offset = cluster_offset(cluster);
+
+        let mut dot = [0u8; 32];
+        dot[0..11].copy_from_slice(b".          ");
+        dot[11] = 0x10;
+        timestamp.write_to_dir_entry(&mut dot);
+        write_u16(&mut dot[26..28], cluster);
+        self.image[offset..offset + 32].copy_from_slice(&dot);
+
+        let mut dotdot = [0u8; 32];
+        dotdot[0..11].copy_from_slice(b"..         ");
+        dotdot[11] = 0x10;
+        timestamp.write_to_dir_entry(&mut dotdot);
+        write_u16(&mut dotdot[26..28], parent_cluster);
+        self.image[offset + 32..offset + 64].copy_from_slice(&dotdot);
+    }
+
     fn write_dir_entry(&mut self, parent: Option<&str>, entry: &[u8; 32]) -> Result<()> {
         let (start, len) = if let Some(parent) = parent {
             let cluster = self
@@ -619,7 +744,7 @@ impl FatBuilder {
 fn write_boot_sector(image: &mut [u8], label: Option<&str>) {
     let boot = &mut image[..BYTES_PER_SECTOR];
     boot[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
-    boot[3..11].copy_from_slice(b"MSDOS5.0");
+    boot[3..11].copy_from_slice(b"MTOO4049");
     write_u16(&mut boot[11..13], BYTES_PER_SECTOR as u16);
     boot[13] = SECTORS_PER_CLUSTER;
     write_u16(&mut boot[14..16], RESERVED_SECTORS);
@@ -632,10 +757,20 @@ fn write_boot_sector(image: &mut [u8], label: Option<&str>) {
     write_u16(&mut boot[26..28], 2);
     boot[36] = 0x00;
     boot[38] = 0x29;
-    write_u32(&mut boot[39..43], 0x1234_5678);
+    write_u32(&mut boot[39..43], volume_serial());
     let volume = label.and_then(volume_label_11).unwrap_or(*b"NO NAME    ");
     boot[43..54].copy_from_slice(&volume);
     boot[54..62].copy_from_slice(b"FAT12   ");
+    boot[62..110].copy_from_slice(&[
+        0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xc0, 0xfc, 0xb9, 0x00, 0x01, 0xbe, 0x00, 0x7c,
+        0xbf, 0x00, 0x80, 0xf3, 0xa5, 0xea, 0x56, 0x00, 0x00, 0x08, 0xb8, 0x01, 0x02, 0xbb,
+        0x00, 0x7c, 0xba, 0x80, 0x00, 0xb9, 0x01, 0x00, 0xcd, 0x13, 0x72, 0x05, 0xea, 0x00,
+        0x7c, 0x00, 0x00, 0xcd, 0x19, 0x00,
+    ]);
+    boot[446..462].copy_from_slice(&[
+        0x80, 0x00, 0x01, 0x00, 0x01, 0x01, 0x12, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x40, 0x0b,
+        0x00, 0x00,
+    ]);
     boot[510] = 0x55;
     boot[511] = 0xaa;
 }
@@ -669,6 +804,77 @@ fn read_root_entries(data: &[u8]) -> (Option<String>, Vec<String>) {
         }
     }
     (label, files)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FatTimestamp {
+    time: u16,
+    date: u16,
+}
+
+impl FatTimestamp {
+    fn now() -> Self {
+        Self::from_system_time(Some(SystemTime::now()))
+    }
+
+    fn from_system_time(time: Option<SystemTime>) -> Self {
+        let seconds = time
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(315_532_800);
+        Self::from_unix_seconds(seconds)
+    }
+
+    fn from_unix_seconds(seconds: u64) -> Self {
+        let days = seconds / 86_400;
+        let day_seconds = seconds % 86_400;
+        let (year, month, day) = ymd_from_unix_days(days);
+        let year = year.clamp(1980, 2107) as u16;
+        let month = month.clamp(1, 12) as u16;
+        let day = day.clamp(1, 31) as u16;
+        let hour = (day_seconds / 3600) as u16;
+        let minute = ((day_seconds % 3600) / 60) as u16;
+        let second = ((day_seconds % 60) / 2) as u16;
+
+        Self {
+            time: (hour << 11) | (minute << 5) | second,
+            date: ((year - 1980) << 9) | (month << 5) | day,
+        }
+    }
+
+    fn write_to_dir_entry(self, entry: &mut [u8; 32]) {
+        write_u16(&mut entry[14..16], self.time);
+        write_u16(&mut entry[16..18], self.date);
+        write_u16(&mut entry[18..20], self.date);
+        write_u16(&mut entry[22..24], self.time);
+        write_u16(&mut entry[24..26], self.date);
+    }
+}
+
+fn ymd_from_unix_days(days_since_epoch: u64) -> (i32, u32, u32) {
+    let z = days_since_epoch as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
+}
+
+fn volume_serial() -> u32 {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as u32)
+        .unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    seconds.rotate_left(16) ^ nanos
 }
 
 fn split_image_path(path: &str) -> (Option<&str>, &str) {
@@ -780,7 +986,7 @@ fn write_u32(out: &mut [u8], value: u32) {
 }
 
 fn slot_offset(slot: u16) -> u64 {
-    slot as u64 * FLOPPY_SIZE as u64
+    slot as u64 * SLOT_STRIDE as u64
 }
 
 fn validate_slot(slot: u16) -> Result<()> {
@@ -1111,16 +1317,59 @@ mod tests {
     fn creates_designer_disk_image_from_generated_layout() {
         let dir = temp_dir("designer_disk_image");
         fs::create_dir_all(dir.join("disk/MENU_01")).unwrap();
+        fs::create_dir_all(dir.join("disk/MENU_02")).unwrap();
         fs::write(dir.join("disk/MENU_SEL.PHV"), b"root").unwrap();
         fs::write(dir.join("disk/MENU_01/MENU_01.MHV"), b"menu").unwrap();
         fs::write(dir.join("disk/MENU_01/DES01_01.SHV"), b"design").unwrap();
+        fs::write(dir.join("disk/MENU_02/MENU_02.MHV"), b"menu2").unwrap();
         let image = dir.join("slot.img");
-        create_designer_disk_image(&dir.join("disk"), &image, Some("DESIGNER1")).unwrap();
+        let written = vec![
+            dir.join("disk/MENU_SEL.PHV"),
+            dir.join("disk/MENU_01"),
+            dir.join("disk/MENU_02"),
+        ];
+        create_designer_disk_image(&dir.join("disk"), &written, &image, Some("DESIGNER1"))
+            .unwrap();
         let inspected = inspect_image(&image).unwrap();
         assert!(inspected.valid_fat12_1440);
         assert!(inspected.files.contains(&"MENU_SEL.PHV".to_owned()));
         assert!(inspected.files.contains(&"MENU_01".to_owned()));
+        assert!(inspected.files.contains(&"MENU_02".to_owned()));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn subdirectories_include_dot_entries() {
+        let dir = temp_dir("dot_entries");
+        fs::create_dir_all(dir.join("disk/MENU_01")).unwrap();
+        fs::write(dir.join("disk/MENU_SEL.PHV"), b"root").unwrap();
+        fs::write(dir.join("disk/MENU_01/MENU_01.MHV"), b"menu").unwrap();
+        let image = dir.join("slot.img");
+        let written = vec![dir.join("disk/MENU_SEL.PHV"), dir.join("disk/MENU_01")];
+        create_designer_disk_image(&dir.join("disk"), &written, &image, Some("DESIGNER1"))
+            .unwrap();
+
+        let bytes = fs::read(&image).unwrap();
+        let menu_cluster = first_cluster_for_root_name(&bytes, b"MENU_01    ").unwrap();
+        let dir_offset = cluster_offset(menu_cluster);
+        assert_eq!(&bytes[dir_offset..dir_offset + 11], b".          ");
+        assert_eq!(&bytes[dir_offset + 32..dir_offset + 43], b"..         ");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn first_cluster_for_root_name(image: &[u8], name: &[u8; 11]) -> Option<u16> {
+        let root_start = FIRST_ROOT_SECTOR * BYTES_PER_SECTOR;
+        let root_end = root_start + ROOT_DIR_SECTORS * BYTES_PER_SECTOR;
+        for entry in image[root_start..root_end].chunks(32) {
+            if entry[0] == 0x00 {
+                break;
+            }
+            if &entry[0..11] == name {
+                return Some(u16::from_le_bytes([entry[26], entry[27]]));
+            }
+        }
+        None
     }
 
     fn temp_dir(name: &str) -> PathBuf {

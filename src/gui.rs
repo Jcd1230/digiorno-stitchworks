@@ -1,0 +1,1121 @@
+use crate::disk::{
+    DiskDesignInput, DiskExportOptions, MHV_PREVIEW_HEIGHT, MHV_PREVIEW_WIDTH,
+    export_single_menu_disk, load_disk_designs, render_mhv_preview_pixels,
+};
+use crate::gotek::{
+    GotekDeviceCandidate, create_designer_disk_image, list_gotek_device_candidates, verify_slot,
+    write_slot,
+};
+use crate::inkstitch::{LoadOptions, load_inkstitch_json_file};
+use crate::model::{Design, InputYAxis, SignatureMode, StitchCommand};
+use crate::preview::DESIGNER1_PALETTE;
+use crate::shv::{ShvOptions, ShvReadbackReport, build_shv, validate_generated_shv};
+use eframe::egui;
+use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const SETTINGS_DIR: &str = "designer1-rs";
+const SETTINGS_FILE: &str = "gui.toml";
+
+pub fn run() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 920.0])
+            .with_min_inner_size([900.0, 600.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Designer 1 SHV Converter",
+        options,
+        Box::new(|_cc| Ok(Box::new(Designer1App::new()))),
+    )
+}
+
+struct Designer1App {
+    input_path: Option<PathBuf>,
+    disk_root: Option<PathBuf>,
+    disk_designs: Vec<DiskDesignInput>,
+    selected_disk_index: Option<usize>,
+    design: Option<Design>,
+    shv_bytes: Option<Vec<u8>>,
+    report: Option<ShvReadbackReport>,
+    preview_bytes: Option<Vec<u8>>,
+
+    name_override: String,
+    scale: f64,
+    center: bool,
+    input_y_axis: InputYAxis,
+    signature: SignatureMode,
+    show_cm_grid: bool,
+    show_jumps: bool,
+    path_zoom: f32,
+    path_pan: Vec2,
+    show_mhv_preview: bool,
+    show_color_debug: bool,
+    last_open_dir: PathBuf,
+    gotek_device_path: String,
+    gotek_devices: Vec<GotekDeviceCandidate>,
+    gotek_slot: u16,
+
+    status: String,
+    error: Option<String>,
+}
+
+impl Default for Designer1App {
+    fn default() -> Self {
+        Self {
+            input_path: None,
+            disk_root: None,
+            disk_designs: Vec::new(),
+            selected_disk_index: None,
+            design: None,
+            shv_bytes: None,
+            report: None,
+            preview_bytes: None,
+            name_override: String::new(),
+            scale: 1.0,
+            center: true,
+            input_y_axis: InputYAxis::Down,
+            signature: SignatureMode::Official,
+            show_cm_grid: true,
+            show_jumps: true,
+            path_zoom: 1.0,
+            path_pan: Vec2::ZERO,
+            show_mhv_preview: false,
+            show_color_debug: false,
+            last_open_dir: initial_open_dir(),
+            gotek_device_path: String::new(),
+            gotek_devices: Vec::new(),
+            gotek_slot: 1,
+            status: "Load an Ink/Stitch JSON file to begin.".to_owned(),
+            error: None,
+        }
+    }
+}
+
+impl eframe::App for Designer1App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        egui::Panel::top("top_bar").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Designer 1 SHV Converter");
+                ui.separator();
+                if ui.button("Open JSON…").clicked() {
+                    self.pick_and_load_json();
+                }
+                if ui.button("Open Folder…").clicked() {
+                    self.pick_and_load_folder();
+                }
+                if ui.button("Rebuild").clicked() {
+                    self.rebuild_current();
+                }
+                if ui.button("Export SHV…").clicked() {
+                    self.export_shv();
+                }
+                if ui.button("Generate Disk Files").clicked() {
+                    self.export_disk();
+                }
+                if ui
+                    .add_enabled(
+                        self.disk_root.is_some(),
+                        egui::Button::new("Export To Gotek Slot"),
+                    )
+                    .clicked()
+                {
+                    self.export_to_gotek_slot();
+                }
+                if ui
+                    .add_enabled(
+                        !self.disk_designs.is_empty(),
+                        egui::Button::new("MHV Preview"),
+                    )
+                    .clicked()
+                {
+                    self.show_mhv_preview = true;
+                }
+            });
+        });
+
+        self.show_mhv_preview_window(&ctx);
+
+        egui::Panel::left("options")
+            .resizable(true)
+            .default_size(320.0)
+            .show_inside(ui, |ui| {
+                ui.heading("Options");
+                ui.add_space(8.0);
+
+                ui.label("Input");
+                let input_text = self
+                    .input_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .or_else(|| {
+                        self.disk_root
+                            .as_ref()
+                            .map(|p| format!("Disk root: {}", p.display()))
+                    })
+                    .unwrap_or_else(|| "No file loaded".to_owned());
+                ui.monospace(input_text);
+
+                ui.separator();
+                ui.label("Internal SHV name");
+                ui.text_edit_singleline(&mut self.name_override);
+
+                ui.horizontal(|ui| {
+                    ui.label("Scale");
+                    ui.add(
+                        egui::DragValue::new(&mut self.scale)
+                            .speed(0.05)
+                            .range(0.01..=100.0),
+                    );
+                });
+                ui.checkbox(&mut self.center, "Center design at SHV origin");
+
+                egui::ComboBox::from_label("Input Y axis")
+                    .selected_text(self.input_y_axis.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.input_y_axis,
+                            InputYAxis::Down,
+                            "down / Ink-Stitch SVG",
+                        );
+                        ui.selectable_value(
+                            &mut self.input_y_axis,
+                            InputYAxis::Up,
+                            "up / Cartesian",
+                        );
+                    });
+
+                egui::ComboBox::from_label("SHV signature")
+                    .selected_text(self.signature.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.signature,
+                            SignatureMode::Official,
+                            "official Viking notice",
+                        );
+                        ui.selectable_value(
+                            &mut self.signature,
+                            SignatureMode::Zero,
+                            "zero-filled Embird-style",
+                        );
+                    });
+
+                if ui.button("Rebuild preview + SHV bytes").clicked() {
+                    self.rebuild_current();
+                }
+
+                ui.checkbox(&mut self.show_color_debug, "Show color debug swatch in MHV slot 6");
+
+                if let Some(design) = &self.design {
+                    ui.separator();
+                    ui.heading("Design stats");
+                    let stats = design.stats();
+                    egui::Grid::new("stats_grid")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Name");
+                            ui.monospace(&design.name);
+                            ui.end_row();
+                            ui.label("Threads");
+                            ui.label(stats.thread_count.to_string());
+                            ui.end_row();
+                            ui.label("Points");
+                            ui.label(stats.point_count.to_string());
+                            ui.end_row();
+                            ui.label("Stitches");
+                            ui.label(stats.stitches.to_string());
+                            ui.end_row();
+                            ui.label("Jumps");
+                            ui.label(stats.jumps.to_string());
+                            ui.end_row();
+                            ui.label("Bounds");
+                            ui.monospace(format!(
+                                "L{} R{} B{} T{} mm",
+                                mm(stats.left),
+                                mm(stats.right),
+                                mm(stats.bottom),
+                                mm(stats.top)
+                            ));
+                            ui.end_row();
+                            ui.label("Size");
+                            ui.monospace(format!("{} × {} mm", mm(stats.width), mm(stats.height)));
+                            ui.end_row();
+                        });
+                }
+
+                if !self.disk_designs.is_empty() {
+                    ui.separator();
+                    ui.heading("Disk designs");
+                    if ui.button("MHV Preview").clicked() {
+                        self.show_mhv_preview = true;
+                    }
+                    let mut selected = None;
+                    for (idx, item) in self.disk_designs.iter().enumerate() {
+                        let is_selected = self.selected_disk_index == Some(idx);
+                        let label = format!("DES01_{:02} {}", item.slot, item.label);
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            selected = Some(idx);
+                        }
+                    }
+                    if let Some(idx) = selected {
+                        self.select_disk_design(idx);
+                    }
+                }
+
+                if self.disk_root.is_some() {
+                    ui.separator();
+                    ui.heading("Gotek");
+                    ui.horizontal(|ui| {
+                        ui.label("Device");
+                        if ui.button("Refresh").clicked() {
+                            self.refresh_gotek_devices();
+                        }
+                    });
+                    if self.gotek_devices.is_empty() {
+                        ui.label("No initialized Gotek devices detected.");
+                    } else {
+                        let selected = self
+                            .gotek_devices
+                            .iter()
+                            .find(|candidate| {
+                                candidate.path == PathBuf::from(self.gotek_device_path.trim())
+                            })
+                            .map(|candidate| candidate.label.clone())
+                            .unwrap_or_else(|| "Select device…".to_owned());
+                        egui::ComboBox::from_id_salt("gotek_device")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for candidate in self.gotek_devices.clone() {
+                                    if ui
+                                        .selectable_label(
+                                            candidate.path
+                                                == PathBuf::from(self.gotek_device_path.trim()),
+                                            &candidate.label,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.gotek_device_path =
+                                            candidate.path.display().to_string();
+                                    }
+                                }
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.gotek_device_path);
+                        if ui.button("Browse…").clicked() {
+                            self.pick_gotek_device_file();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Slot");
+                        ui.add(egui::DragValue::new(&mut self.gotek_slot).range(0..=999));
+                    });
+                    if ui.button("Export To Gotek Slot").clicked() {
+                        self.export_to_gotek_slot();
+                    }
+                }
+
+                ui.separator();
+                ui.heading("Embedded SHV thumbnail preview");
+                if let (Some(preview), Some(report)) = (&self.preview_bytes, &self.report) {
+                    ui.label(format!(
+                        "{} x {} px",
+                        report.preview_width, report.preview_height
+                    ));
+                    draw_shv_preview(
+                        ui,
+                        preview,
+                        report.preview_width as usize,
+                        report.preview_height as usize,
+                    );
+                } else {
+                    ui.label("No preview built.");
+                }
+
+                ui.separator();
+                ui.heading("Status");
+                ui.label(&self.status);
+                if let Some(error) = &self.error {
+                    ui.colored_label(Color32::from_rgb(190, 40, 40), error);
+                }
+            });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            if let Some(design) = &self.design {
+                draw_design_path(
+                    ui,
+                    design,
+                    &mut self.show_cm_grid,
+                    &mut self.show_jumps,
+                    &mut self.path_zoom,
+                    &mut self.path_pan,
+                );
+            } else {
+                ui.label("No design loaded.");
+            }
+        });
+    }
+}
+
+impl Designer1App {
+    fn new() -> Self {
+        let mut app = Self::default();
+        app.refresh_gotek_devices();
+        if let Some(path) = load_last_open_dir().filter(|path| path.is_dir()) {
+            app.last_open_dir = path.clone();
+            app.load_folder(path);
+        }
+        app
+    }
+
+    fn pick_and_load_json(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
+            .add_filter("Ink/Stitch JSON", &["json"])
+            .pick_file()
+        {
+            self.remember_open_dir(path.parent().unwrap_or(&path));
+            self.input_path = Some(path);
+            self.disk_root = None;
+            self.disk_designs.clear();
+            self.selected_disk_index = None;
+            self.rebuild_current();
+        }
+    }
+
+    fn pick_and_load_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
+            .pick_folder()
+        {
+            self.load_folder(path);
+        }
+    }
+
+    fn load_options(&self) -> LoadOptions {
+        LoadOptions {
+            scale: self.scale,
+            center: self.center,
+            input_y_axis: self.input_y_axis,
+        }
+    }
+
+    fn disk_options(&self) -> DiskExportOptions {
+        DiskExportOptions {
+            signature: self.signature,
+            scale: self.scale,
+            center: self.center,
+            input_y_axis: self.input_y_axis,
+            disk_title: "Designer 1 Disk".to_owned(),
+            menu_label: "Menu 1".to_owned(),
+            show_color_debug: self.show_color_debug,
+        }
+    }
+
+    fn rebuild_current(&mut self) {
+        self.error = None;
+        if let (Some(root), Some(idx)) = (self.disk_root.clone(), self.selected_disk_index) {
+            match load_disk_designs(&root, &self.disk_options()) {
+                Ok(designs) => {
+                    self.disk_designs = designs;
+                    self.select_disk_design(idx.min(self.disk_designs.len().saturating_sub(1)));
+                }
+                Err(err) => {
+                    self.error = Some(err.to_string());
+                    self.status = "Folder rebuild failed.".to_owned();
+                }
+            }
+            return;
+        }
+        let Some(path) = self.input_path.clone() else {
+            self.error = Some("No JSON file selected.".to_owned());
+            return;
+        };
+
+        match self.rebuild_from_path(&path) {
+            Ok(()) => {
+                self.status = "Loaded and validated generated SHV bytes.".to_owned();
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Rebuild failed.".to_owned();
+                self.design = None;
+                self.shv_bytes = None;
+                self.report = None;
+                self.preview_bytes = None;
+            }
+        }
+    }
+
+    fn load_folder(&mut self, path: PathBuf) {
+        self.error = None;
+        match load_disk_designs(&path, &self.disk_options()) {
+            Ok(designs) => {
+                self.remember_open_dir(&path);
+                self.input_path = None;
+                self.disk_root = Some(path);
+                self.disk_designs = designs;
+                self.selected_disk_index = None;
+                if !self.disk_designs.is_empty() {
+                    self.select_disk_design(0);
+                }
+                self.status = format!("Loaded {} disk design(s).", self.disk_designs.len());
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Folder load failed.".to_owned();
+                self.disk_root = None;
+                self.disk_designs.clear();
+                self.selected_disk_index = None;
+            }
+        }
+    }
+
+    fn select_disk_design(&mut self, idx: usize) {
+        self.error = None;
+        let Some(item) = self.disk_designs.get(idx) else {
+            self.error = Some("Selected disk design is out of range.".to_owned());
+            return;
+        };
+        let design = item.design.clone();
+        let slot = item.slot;
+        let label = item.label.clone();
+        match self.rebuild_from_design(design) {
+            Ok(()) => {
+                self.selected_disk_index = Some(idx);
+                self.name_override.clear();
+                self.status = format!("Selected DES01_{slot:02}: {label}");
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Preview build failed.".to_owned();
+            }
+        }
+    }
+
+    fn rebuild_from_path(&mut self, path: &Path) -> anyhow::Result<()> {
+        let mut design = load_inkstitch_json_file(path, &self.load_options())?;
+        if self.name_override.trim().is_empty() {
+            self.name_override = design.name.clone();
+        } else {
+            design.name = self.name_override.trim().to_owned();
+        }
+
+        self.rebuild_from_design(design)
+    }
+
+    fn rebuild_from_design(&mut self, design: Design) -> anyhow::Result<()> {
+        let options = ShvOptions {
+            name: None,
+            signature: self.signature,
+        };
+        let shv = build_shv(&design, &options)?;
+        let report = validate_generated_shv(&shv)?;
+        let preview = shv[report.preview_offset..report.preview_offset + report.preview_length].to_vec();
+
+        self.design = Some(design);
+        self.shv_bytes = Some(shv);
+        self.report = Some(report);
+        self.preview_bytes = Some(preview);
+        Ok(())
+    }
+
+    fn export_shv(&mut self) {
+        self.rebuild_current();
+        if self.shv_bytes.is_none() {
+            return;
+        }
+        let default_name = if self.name_override.trim().is_empty() {
+            "DESIGN.SHV".to_owned()
+        } else {
+            format!("{}.SHV", self.name_override.trim().to_ascii_uppercase())
+        };
+        if let Some(mut path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
+            .add_filter("Husqvarna SHV", &["shv", "SHV"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            if path.extension().is_none() {
+                path.set_extension("SHV");
+            }
+            let bytes = self.shv_bytes.as_ref().unwrap();
+            match std::fs::write(&path, bytes) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        self.remember_open_dir(parent);
+                    }
+                    self.status = format!("Exported {}", path.display());
+                    self.error = None;
+                }
+                Err(err) => {
+                    self.error = Some(format!("Failed to write {}: {err}", path.display()));
+                }
+            }
+        }
+    }
+
+    fn export_disk(&mut self) {
+        self.error = None;
+        let Some(root) = self.disk_root.clone() else {
+            self.error = Some("Open a disk root folder first.".to_owned());
+            return;
+        };
+        match export_single_menu_disk(&root, &self.disk_options()) {
+            Ok(report) => {
+                self.status = format!(
+                    "Generated {} design(s) and {} disk file(s).",
+                    report.designs.len(),
+                    report.written_files.len()
+                );
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                self.status = "Disk export failed.".to_owned();
+            }
+        }
+    }
+
+    fn pick_gotek_device_file(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_directory(&self.last_open_dir)
+            .pick_file()
+        {
+            if let Some(parent) = path.parent() {
+                self.remember_open_dir(parent);
+            }
+            self.gotek_device_path = path.display().to_string();
+        }
+    }
+
+    fn refresh_gotek_devices(&mut self) {
+        self.gotek_devices = list_gotek_device_candidates();
+        if self.gotek_device_path.trim().is_empty() {
+            if let Some(candidate) = self.gotek_devices.first() {
+                self.gotek_device_path = candidate.path.display().to_string();
+            }
+        }
+    }
+
+    fn export_to_gotek_slot(&mut self) {
+        self.error = None;
+        let Some(root) = self.disk_root.clone() else {
+            self.error = Some("Open a disk root folder first.".to_owned());
+            return;
+        };
+        if self.gotek_device_path.trim().is_empty() {
+            self.error = Some("Enter a Gotek device path or bank file.".to_owned());
+            return;
+        }
+        let device = PathBuf::from(self.gotek_device_path.trim());
+        let slot = self.gotek_slot;
+        let image = temp_gotek_image_path(slot);
+
+        let result = (|| -> anyhow::Result<()> {
+            let export = export_single_menu_disk(&root, &self.disk_options())?;
+            create_designer_disk_image(&root, &export.written_files, &image, None)?;
+            let write = write_slot(&device, slot, &image)?;
+            let verify = verify_slot(&device, slot, &image)?;
+            if !verify.ok {
+                anyhow::bail!(
+                    "Gotek slot verification failed: local {} device {}",
+                    verify.local_sha256,
+                    verify.device_sha256
+                );
+            }
+            let file_list = export
+                .written_files
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.status = format!(
+                "Exported {} design(s) with {} signature, generated [{}], wrote {} bytes to slot {slot}, and verified.",
+                export.designs.len(),
+                self.signature,
+                file_list,
+                write.bytes
+            );
+            Ok(())
+        })();
+
+        let _ = fs::remove_file(&image);
+        if let Err(err) = result {
+            self.error = Some(format!(
+                "{err}\n\nThe selected target does not look like an initialized Gotek device. Format or initialize it first, for example with `designer1-gotek mkimg` for a test bank slot or the CLI Gotek tooling for the real USB device, then try again."
+            ));
+            self.status = "Gotek export failed.".to_owned();
+        }
+    }
+
+    fn show_mhv_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.show_mhv_preview {
+            return;
+        }
+
+        egui::Window::new("MENU_01.MHV Preview")
+            .open(&mut self.show_mhv_preview)
+            .default_size(Vec2::new(560.0, 620.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                if self.disk_designs.is_empty() {
+                    ui.label("Open a folder to preview MENU_01.MHV.");
+                    return;
+                }
+
+                match render_mhv_preview_pixels(&self.disk_designs, self.show_color_debug) {
+                    Ok(pixels) => draw_mhv_preview(ui, &pixels),
+                    Err(err) => {
+                        ui.colored_label(
+                            Color32::from_rgb(190, 40, 40),
+                            format!("Failed to render MHV preview: {err}"),
+                        );
+                    }
+                }
+            });
+    }
+
+    fn remember_open_dir(&mut self, path: &Path) {
+        if path.is_dir() {
+            self.last_open_dir = path.to_path_buf();
+            let _ = save_last_open_dir(path);
+        }
+    }
+}
+
+fn initial_open_dir() -> PathBuf {
+    load_last_open_dir()
+        .filter(|path| path.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("cache"))
+        })?;
+    Some(cache_home.join(SETTINGS_DIR).join(SETTINGS_FILE))
+}
+
+fn load_last_open_dir() -> Option<PathBuf> {
+    let contents = fs::read_to_string(settings_path()?).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("last_open_dir") else {
+            continue;
+        };
+        let Some(value) = value.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = parse_toml_string(value.trim())?;
+        return Some(PathBuf::from(value));
+    }
+    None
+}
+
+fn save_last_open_dir(path: &Path) -> std::io::Result<()> {
+    let Some(settings_path) = settings_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        settings_path,
+        format!(
+            "last_open_dir = \"{}\"\n",
+            escape_toml_string(&path.display().to_string())
+        ),
+    )
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            out.push(match ch {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+fn escape_toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn temp_gotek_image_path(slot: u16) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "designer1-gotek-slot-{slot:03}-{}-{nonce}.img",
+        std::process::id()
+    ))
+}
+
+fn draw_design_path(
+    ui: &mut egui::Ui,
+    design: &Design,
+    show_cm_grid: &mut bool,
+    show_jumps: &mut bool,
+    zoom: &mut f32,
+    pan: &mut Vec2,
+) {
+    let desired = ui.available_size().max(Vec2::new(240.0, 240.0));
+    let (rect, response) = ui.allocate_exact_size(desired, Sense::drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, Color32::from_gray(248));
+
+    let stats = design.stats();
+    let span_x = stats.width.max(1) as f32;
+    let span_y = stats.height.max(1) as f32;
+    let pad = 28.0f32;
+    let fit_scale = ((rect.width() - 2.0 * pad) / span_x).min((rect.height() - 2.0 * pad) / span_y);
+    let scale = fit_scale * *zoom;
+    let center = rect.center() + *pan;
+    let design_center_x = (stats.left + stats.right) as f32 / 2.0;
+    let design_center_y = (stats.bottom + stats.top) as f32 / 2.0;
+
+    let map = |x: i32, y: i32| -> Pos2 {
+        Pos2::new(
+            center.x + (x as f32 - design_center_x) * scale,
+            center.y - (y as f32 - design_center_y) * scale,
+        )
+    };
+
+    if response.dragged() {
+        *pan += ui.input(|i| i.pointer.delta());
+    }
+    if response.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            let old_zoom = *zoom;
+            *zoom = (*zoom * (1.0 + scroll * 0.0015)).clamp(0.1, 20.0);
+            if old_zoom != 0.0 {
+                *pan *= *zoom / old_zoom;
+            }
+        }
+    }
+
+    egui::Area::new(ui.id().with("path_view_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.right_top() + Vec2::new(-8.0, 8.0))
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_premultiplied(255, 255, 255, 225))
+                .stroke(Stroke::new(1.0, Color32::from_gray(210)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(*show_jumps, "Show Jumps").clicked() {
+                            *show_jumps = !*show_jumps;
+                        }
+                        if ui.selectable_label(*show_cm_grid, "Show Grid").clicked() {
+                            *show_cm_grid = !*show_cm_grid;
+                        }
+                        if ui.button("Reset View").clicked() {
+                            *zoom = 1.0;
+                            *pan = Vec2::ZERO;
+                        }
+                    });
+                });
+        });
+
+    if *show_cm_grid {
+        draw_cm_grid(
+            &painter,
+            rect,
+            stats.left,
+            stats.right,
+            stats.bottom,
+            stats.top,
+            &map,
+        );
+    }
+
+    let mut prev: Option<Pos2> = None;
+    let mut thread_index = 0usize;
+    let mut current_color = thread_color(design, thread_index);
+    for p in &design.points {
+        match &p.command {
+            StitchCommand::End => break,
+            StitchCommand::Jump | StitchCommand::Trim => {
+                let pos = map(p.x, p.y);
+                if *show_jumps {
+                    if let Some(prev_pos) = prev {
+                        draw_dotted_line(
+                            &painter,
+                            prev_pos,
+                            pos,
+                            Stroke::new(1.0, Color32::from_rgb(210, 42, 42)),
+                        );
+                    }
+                    painter.circle_filled(pos, 1.5, Color32::from_rgb(210, 42, 42));
+                }
+                prev = Some(pos);
+            }
+            StitchCommand::Stitch => {
+                let pos = map(p.x, p.y);
+                if let Some(prev_pos) = prev {
+                    painter.line_segment([prev_pos, pos], Stroke::new(1.0, current_color));
+                } else {
+                    painter.circle_filled(pos, 1.5, current_color);
+                }
+                prev = Some(pos);
+            }
+            StitchCommand::ColorChange | StitchCommand::Stop => {
+                thread_index = (thread_index + 1).min(design.threads.len().saturating_sub(1));
+                current_color = thread_color(design, thread_index);
+                prev = None;
+            }
+            StitchCommand::Other(_) => {
+                prev = None;
+            }
+        }
+    }
+}
+
+fn draw_cm_grid(
+    painter: &egui::Painter,
+    rect: Rect,
+    left: i32,
+    right: i32,
+    bottom: i32,
+    top: i32,
+    map: &impl Fn(i32, i32) -> Pos2,
+) {
+    const CM_IN_SHV_UNITS: i32 = 100;
+    let stroke = Stroke::new(1.0, Color32::from_gray(220));
+    let axis_stroke = Stroke::new(1.0, Color32::from_gray(185));
+    let grid_left = (left / CM_IN_SHV_UNITS - 1) * CM_IN_SHV_UNITS;
+    let grid_right = (right / CM_IN_SHV_UNITS + 1) * CM_IN_SHV_UNITS;
+    let grid_bottom = (bottom / CM_IN_SHV_UNITS - 1) * CM_IN_SHV_UNITS;
+    let grid_top = (top / CM_IN_SHV_UNITS + 1) * CM_IN_SHV_UNITS;
+
+    let mut x = grid_left;
+    while x <= grid_right {
+        let a = map(x, grid_bottom);
+        let b = map(x, grid_top);
+        let line = clipped_segment(rect, a, b);
+        if let Some([a, b]) = line {
+            painter.line_segment([a, b], if x == 0 { axis_stroke } else { stroke });
+        }
+        x += CM_IN_SHV_UNITS;
+    }
+
+    let mut y = grid_bottom;
+    while y <= grid_top {
+        let a = map(grid_left, y);
+        let b = map(grid_right, y);
+        let line = clipped_segment(rect, a, b);
+        if let Some([a, b]) = line {
+            painter.line_segment([a, b], if y == 0 { axis_stroke } else { stroke });
+        }
+        y += CM_IN_SHV_UNITS;
+    }
+}
+
+fn clipped_segment(rect: Rect, a: Pos2, b: Pos2) -> Option<[Pos2; 2]> {
+    let min_x = a.x.min(b.x).max(rect.left());
+    let max_x = a.x.max(b.x).min(rect.right());
+    let min_y = a.y.min(b.y).max(rect.top());
+    let max_y = a.y.max(b.y).min(rect.bottom());
+    if (a.x - b.x).abs() < f32::EPSILON && min_y <= max_y {
+        Some([Pos2::new(a.x, min_y), Pos2::new(a.x, max_y)])
+    } else if (a.y - b.y).abs() < f32::EPSILON && min_x <= max_x {
+        Some([Pos2::new(min_x, a.y), Pos2::new(max_x, a.y)])
+    } else {
+        None
+    }
+}
+
+fn mm(units: i32) -> String {
+    format!("{:.1}", units as f32 * 0.1)
+}
+
+fn draw_dotted_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+
+    let direction = delta / length;
+    let dash = 5.0;
+    let gap = 4.0;
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + dash).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * dash_end],
+            stroke,
+        );
+        offset += dash + gap;
+    }
+}
+
+fn thread_color(design: &Design, index: usize) -> Color32 {
+    let Some(thread) = design.threads.get(index).or_else(|| design.threads.first()) else {
+        return Color32::BLACK;
+    };
+    parse_hex_color(thread.color.as_deref()).unwrap_or(Color32::BLACK)
+}
+
+fn parse_hex_color(value: Option<&str>) -> Option<Color32> {
+    let mut s = value?.trim();
+    if let Some(stripped) = s.strip_prefix('#') {
+        s = stripped;
+    }
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+fn draw_mhv_preview(ui: &mut egui::Ui, pixels: &[u8]) {
+    let native = Vec2::new(MHV_PREVIEW_HEIGHT as f32, MHV_PREVIEW_WIDTH as f32);
+    let available = ui.available_size().max(Vec2::new(160.0, 160.0));
+    let scale = (available.x / native.x)
+        .min(available.y / native.y)
+        .max(0.25);
+    let desired = native * scale;
+    let (rect, _response) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, mhv_preview_color(0));
+
+    let sx = rect.width() / MHV_PREVIEW_HEIGHT as f32;
+    let sy = rect.height() / MHV_PREVIEW_WIDTH as f32;
+    for y in 0..MHV_PREVIEW_HEIGHT {
+        for x in 0..MHV_PREVIEW_WIDTH {
+            let value = pixels[y * MHV_PREVIEW_WIDTH + x];
+            if value == 0 {
+                continue;
+            }
+            let preview_x = y;
+            let preview_y = MHV_PREVIEW_WIDTH - 1 - x;
+            let color = mhv_preview_color(value);
+            let cell = Rect::from_min_size(
+                Pos2::new(
+                    rect.left() + preview_x as f32 * sx,
+                    rect.top() + preview_y as f32 * sy,
+                ),
+                Vec2::new(sx.max(1.0), sy.max(1.0)),
+            );
+            painter.rect_filled(cell, 0.0, color);
+        }
+    }
+}
+
+fn mhv_preview_color(value: u8) -> Color32 {
+    let [r, g, b] = DESIGNER1_PALETTE
+        .get(value as usize)
+        .copied()
+        .unwrap_or([30, 30, 30]);
+    Color32::from_rgb(r, g, b)
+}
+
+fn draw_shv_preview(ui: &mut egui::Ui, preview_bytes: &[u8], width: usize, height: usize) {
+    let pixels = decode_4bpp_preview(preview_bytes, width, height);
+    let cell = 5.0f32;
+    let native = Vec2::new(height as f32 * cell, width as f32 * cell);
+    let max_size = Vec2::new(ui.available_width(), 260.0);
+    let scale = (max_size.x / native.x)
+        .min(max_size.y / native.y)
+        .min(1.0)
+        .max(0.0);
+    let desired = native * scale;
+    let (rect, _response) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, mhv_preview_color(0));
+
+    let sx = rect.width() / height as f32;
+    let sy = rect.height() / width as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let value = pixels[y * width + x];
+            if value == 0 {
+                continue;
+            }
+            let color = mhv_preview_color(value);
+            let preview_x = y;
+            let preview_y = width - 1 - x;
+            let r = Rect::from_min_size(
+                Pos2::new(
+                    rect.left() + preview_x as f32 * sx,
+                    rect.top() + preview_y as f32 * sy,
+                ),
+                Vec2::new(sx.max(1.0), sy.max(1.0)),
+            );
+            painter.rect_filled(r, 0.0, color);
+        }
+    }
+}
+
+fn decode_4bpp_preview(preview_bytes: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let stride = width.div_ceil(2);
+    let mut pixels = vec![0u8; width * height];
+    for y in 0..height {
+        for x in 0..stride {
+            let byte = preview_bytes.get(y * stride + x).copied().unwrap_or(0);
+            let px = x * 2;
+            if px < width {
+                pixels[y * width + px] = (byte >> 4) & 0x0f;
+            }
+            if px + 1 < width {
+                pixels[y * width + px + 1] = byte & 0x0f;
+            }
+        }
+    }
+    pixels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_path_string_round_trips_quotes_and_backslashes() {
+        let path = r#"/tmp/designer "one"\folder"#;
+        let encoded = format!("\"{}\"", escape_toml_string(path));
+        assert_eq!(parse_toml_string(&encoded).as_deref(), Some(path));
+    }
+}

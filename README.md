@@ -1,34 +1,32 @@
-# Designer 1 SHV Tools
+# digiorno-stitchworks
 
-Experimental Rust tools for converting Ink/Stitch JSON exports into Husqvarna/Viking Designer 1 `.SHV` design files.
+Rust tools for working with Husqvarna/Viking Designer 1 embroidery media.
 
-This is a draft project scaffold. It ports the Python proof-of-concept logic into a modular Rust library, then exposes it through both a modern CLI and an `egui` desktop app.
+This project focuses on practical interoperability with real Designer 1 hardware. It can load and normalize Ink/Stitch JSON exports, write Designer 1 `SHV` design files, build `PHV`/`MHV` menu assets, assemble FAT12 floppy images, and manage Gotek slot images from both a CLI and a desktop GUI.
 
-## What it currently does
+## Features
 
-- Loads Ink/Stitch JSON with `threadlist`, `extras.name`, and `stitches` rows shaped like `[x, y, "STITCH" | "JUMP" | "END"]`.
-- Normalizes Ink/Stitch/SVG `+Y down` coordinates into internal Cartesian `+Y up` coordinates.
-- Writes a Designer 1 `.SHV`-like file using the empirically decoded layout.
-- Renders a simple 4bpp embedded thumbnail.
-- Read-back validates generated SHV bytes:
-  - record count equals stitch stream length / 2
-  - summary extents match decoded extents
-  - final parsed position returns to origin
-- Provides a native `egui` UI for loading JSON, previewing stitches, and exporting SHV.
-- Provides CLI commands for conversion, inspection, SVG preview, and SHV validation.
+- Convert Ink/Stitch JSON into Designer 1 `SHV` files.
+- Validate generated `SHV` files by decoding the emitted stitch stream.
+- Export a single-menu Designer 1 disk layout with `MENU_SEL.PHV`, `MENU_0X.MHV`, and `DES01_XX.SHV`.
+- Build and inspect 1.44MB FAT12 floppy images for Designer 1 media.
+- Manage Gotek workspaces, slot images, device writes, and verification.
+- Preview designs and machine-style graphics in an `egui` desktop app.
 
-## Project layout
+## Project Status
 
-```text
-src/
-  lib.rs                  Shared library entry point
-  model.rs                Shared domain model and options
-  inkstitch.rs            Ink/Stitch JSON parser and coordinate normalization
-  preview.rs              4bpp preview bitmap and SVG preview rendering
-  shv.rs                  SHV writer/readback validator
-  bin/designer1-cli.rs    CLI frontend
-  bin/designer1-gui.rs    egui desktop frontend
-```
+The format work here is empirical and machine-driven. `PHV`/`MHV` generation and the current `SHV` writer have been validated against known-good media and on-machine behavior documented in [FORMAT_NOTES.md](FORMAT_NOTES.md), but the Designer 1 formats are not fully specified by Husqvarna/Viking.
+
+If you are changing machine-facing output, treat byte-for-byte comparisons and on-machine testing as the final authority.
+
+## Binaries
+
+This repository builds three user-facing binaries plus a compatibility CLI entrypoint:
+
+- `designer1`: combined entrypoint; runs CLI subcommands by default and launches the GUI with `--gui`
+- `designer1-cli`: CLI-only entrypoint for design conversion, validation, preview, and disk export
+- `designer1-gui`: GUI-only entrypoint
+- `designer1-gotek`: lower-level Gotek and FAT12 image management CLI
 
 ## Build
 
@@ -37,64 +35,156 @@ cargo build
 cargo build --release
 ```
 
-## CLI examples
-
-Convert JSON to SHV:
+Run the combined binary:
 
 ```bash
-cargo run --bin designer1-cli -- convert cinnamom.json \
-  --output CINNAMOM.SHV \
+cargo run --bin designer1 -- --help
+cargo run --bin designer1 -- --gui
+```
+
+Run the dedicated entrypoints:
+
+```bash
+cargo run --bin designer1-cli -- --help
+cargo run --bin designer1-gui
+cargo run --bin designer1-gotek -- --help
+```
+
+## CLI Usage
+
+Convert Ink/Stitch JSON to `SHV`:
+
+```bash
+cargo run --bin designer1 -- convert design.json \
+  --output DESIGN01.SHV \
   --signature official \
-  --preview-width 96 \
-  --preview-height 24 \
-  --validation-report cinnamom-readback.json
+  --validation-report design-readback.json
 ```
 
-Inspect normalized JSON stats:
+Inspect normalized design statistics:
 
 ```bash
-cargo run --bin designer1-cli -- inspect cinnamom.json
+cargo run --bin designer1 -- inspect design.json
 ```
 
-Create an SVG preview of the normalized stitch path:
+Write an SVG path preview:
 
 ```bash
-cargo run --bin designer1-cli -- preview-svg cinnamom.json --output cinnamom-preview.svg
+cargo run --bin designer1 -- preview-svg design.json \
+  --output design-preview.svg
 ```
 
-Validate/read back a generated SHV:
+Validate a generated `SHV` file:
 
 ```bash
-cargo run --bin designer1-cli -- validate-shv CINNAMOM.SHV
+cargo run --bin designer1 -- validate-shv DESIGN01.SHV
 ```
+
+Export a single-menu disk folder from JSON inputs in a directory:
+
+```bash
+cargo run --bin designer1 -- export-disk ./disk-project \
+  --disk-title "My Disk" \
+  --menu-label "Menu 1"
+```
+
+The disk export expects JSON files in the root folder and writes Designer 1 menu assets alongside generated design files:
+
+```text
+disk-project/
+  MENU_SEL.PHV
+  MENU_01/
+    DES01_01.SHV
+    DES01_02.SHV
+    ...
+    MENU_01.MHV
+  MENU_02/
+    MENU_02.MHV
+  MENU_03/
+    MENU_03.MHV
+  MENU_04/
+    MENU_04.MHV
+```
+
+## Gotek Workflow
+
+Initialize a managed Gotek workspace:
+
+```bash
+cargo run --bin designer1-gotek -- init --root gotek
+```
+
+Pack workspace slot folders into `.floppy.img` files:
+
+```bash
+cargo run --bin designer1-gotek -- pack --root gotek
+```
+
+Write selected slots to a Gotek device or bank file:
+
+```bash
+cargo run --bin designer1-gotek -- write --root gotek /dev/sdX 1 2 3 --confirm-device
+```
+
+Verify selected slots against the device contents:
+
+```bash
+cargo run --bin designer1-gotek -- verify --root gotek /dev/sdX 1 2 3
+```
+
+Create a blank FAT12 floppy image:
+
+```bash
+cargo run --bin designer1-gotek -- mkimg blank.img --label DESIGNER1
+```
+
+Inspect a floppy image:
+
+```bash
+cargo run --bin designer1-gotek -- inspect-image blank.img
+```
+
+The Gotek CLI also supports raw slot reads, single-slot writes, single-slot verification, and `sync` to pack and write changed workspace slots in one step.
 
 ## GUI
+
+Launch the desktop app with either:
+
+```bash
+cargo run --bin designer1 -- --gui
+```
+
+or:
 
 ```bash
 cargo run --bin designer1-gui
 ```
 
-The GUI lets you:
+The GUI is intended as both a working frontend and an inspection surface. It can load designs, preview stitch geometry, show machine-style previews, export disk assets, and help verify what will actually be written to media.
 
-- open an Ink/Stitch JSON file,
-- adjust scale, centering, Y-axis convention, signature mode, and thumbnail size,
-- view the normalized stitch path,
-- view the embedded SHV thumbnail preview,
-- export the generated SHV.
+## Validation
 
-## Important assumptions
+For format or media changes, a useful workflow is:
 
-- Default input Y-axis is `down`, because Ink/Stitch JSON follows SVG/screen coordinates.
-- Internal coordinates are Cartesian: `+X` right, `+Y` up.
-- SHV raw stitch stream uses `+Y` down, so SHV raw deltas use `dy_raw = -dy_cartesian`.
-- JSON coordinate units are assumed to be close to 0.1 mm units. Use `--scale` if this proves wrong for other exports.
-- The SHV thread color index mapping is still provisional. Black maps to observed color index `7`; other colors map to `0` until the palette is decoded.
-- This writes only `.SHV`; it does not yet generate matching `.PHV`/`.MHV` disk menu/index files.
+```bash
+cargo test --quiet
+cargo check --quiet --bin designer1-gui --bin designer1-cli
+cargo run --bin designer1 -- validate-shv path/to/file.SHV
+cargo run --bin designer1 -- export-disk path/to/folder
+```
 
-## Next likely work
+For Gotek and disk image checks, use `designer1-gotek` together with standard tools such as `mdir`, `mcopy`, `xxd`, `cmp`, and `sha256sum`.
 
-1. Generate/update `MENU_SEL.PHV` and `MENU_XX.MHV` from the same `Design` model.
-2. Expand the thread palette mapping.
-3. Add import support for VP3 or DST after the SHV writer has been tested on-machine.
-4. Add regression tests with known JSON input and expected parsed SHV metadata.
-5. Add an optional project file format for disk layout: folders, design slots, menu labels, and thumbnails.
+## Documentation
+
+- [FORMAT_NOTES.md](FORMAT_NOTES.md): current format notes for `SHV`, `PHV`, `MHV`, disk layout, and verified constants
+- `src/`: Rust implementation of the core library, CLI frontends, GUI, and Gotek tooling
+
+## License
+
+Licensed under either of:
+
+- MIT
+- Apache-2.0
+
+at your option.

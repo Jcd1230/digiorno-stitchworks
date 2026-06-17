@@ -1,5 +1,5 @@
 use crate::model::{Design, SignatureMode, StitchCommand, Thread};
-use crate::preview::render_preview_4bpp;
+use crate::preview::render_preview_4bpp_auto;
 use anyhow::{bail, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -14,8 +14,6 @@ pub const DEFAULT_OTHER_COLOR_INDEX: u8 = 0;
 pub struct ShvOptions {
     pub name: Option<String>,
     pub signature: SignatureMode,
-    pub preview_width: u8,
-    pub preview_height: u8,
 }
 
 impl Default for ShvOptions {
@@ -23,15 +21,12 @@ impl Default for ShvOptions {
         Self {
             name: None,
             signature: SignatureMode::Official,
-            preview_width: 96,
-            preview_height: 24,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct Segment {
-    thread_index: usize,
     color_index: u8,
     start_x_raw: i32,
     start_y_raw: i32,
@@ -91,25 +86,13 @@ pub struct Point {
 
 #[derive(Debug, Clone)]
 struct Event {
-    kind: EventKind,
     x_cart: i32,
     y_cart: i32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EventKind {
-    Stitch,
-    Jump16,
-    Command,
 }
 
 pub fn build_shv(design: &Design, options: &ShvOptions) -> Result<Vec<u8>> {
     let name = options.name.as_deref().unwrap_or(&design.name);
     let name_bytes = safe_ascii_name(name, 32)?;
-    if options.preview_width == 0 || options.preview_height == 0 {
-        bail!("preview dimensions must be non-zero");
-    }
-
     let (segments, event_positions_cart) = build_segments(design)?;
     if segments.len() > u8::MAX as usize {
         bail!("too many color segments: {}", segments.len());
@@ -131,14 +114,14 @@ pub fn build_shv(design: &Design, options: &ShvOptions) -> Result<Vec<u8>> {
         SignatureMode::Zero => ZERO_NOTICE,
     };
 
-    let preview = render_preview_4bpp(design, options.preview_width, options.preview_height, 4)?;
+    let (preview_width, preview_height, preview) = render_preview_4bpp_auto(design)?;
     let preview_header = [
-        options.preview_height,
-        options.preview_width,
-        options.preview_height / 2,
-        options.preview_width / 2,
-        options.preview_height / 2,
-        options.preview_width / 2,
+        preview_height,
+        preview_width,
+        preview_height / 2,
+        preview_width / 2,
+        preview_height / 2,
+        preview_width / 2,
     ];
 
     let mut out = Vec::new();
@@ -211,8 +194,6 @@ fn build_segments(design: &Design) -> Result<(Vec<Segment>, Vec<(i32, i32)>)> {
     // Observed SHV samples return to origin with needle lifted.
     if x_raw != 0 || y_raw != 0 {
         add_jump16(&mut segments.last_mut().unwrap().records, -x_raw, -y_raw)?;
-        x_raw = 0;
-        y_raw = 0;
         event_positions_cart.push((0, 0));
     }
 
@@ -226,7 +207,6 @@ fn build_segments(design: &Design) -> Result<(Vec<Segment>, Vec<(i32, i32)>)> {
 fn new_segment(design: &Design, thread_index: usize, x_raw: i32, y_raw: i32) -> Segment {
     let thread = design.threads.get(thread_index).or_else(|| design.threads.first());
     Segment {
-        thread_index,
         color_index: thread.map(thread_to_color_index).unwrap_or(DEFAULT_BLACK_COLOR_INDEX),
         start_x_raw: x_raw,
         start_y_raw: y_raw,
@@ -439,7 +419,6 @@ pub fn parse_generated_shv(blob: &[u8]) -> Result<ShvReadbackReport> {
                 x_raw += dx;
                 y_raw += dy;
                 events.push(Event {
-                    kind: EventKind::Jump16,
                     x_cart: x_raw,
                     y_cart: -y_raw,
                 });
@@ -447,7 +426,6 @@ pub fn parse_generated_shv(blob: &[u8]) -> Result<ShvReadbackReport> {
                 continue;
             }
             events.push(Event {
-                kind: EventKind::Command,
                 x_cart: x_raw,
                 y_cart: -y_raw,
             });
@@ -460,7 +438,6 @@ pub fn parse_generated_shv(blob: &[u8]) -> Result<ShvReadbackReport> {
         x_raw += dx;
         y_raw += dy;
         events.push(Event {
-            kind: EventKind::Stitch,
             x_cart: x_raw,
             y_cart: -y_raw,
         });

@@ -3,8 +3,10 @@ name = "designer1-tools"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Experimental Ink/Stitch JSON to Husqvarna/Viking Designer 1 SHV converter with CLI and egui UI"
+description = "Rust tools for Husqvarna/Viking Designer 1 embroidery files, disks, and Gotek media"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Jcd1230/digiorno-stitchworks"
 
 [dependencies]
 anyhow = "1.0"
@@ -24,6 +26,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "designer1-cli"
 path = "src/bin/designer1-cli.rs"
+
+[[bin]]
+name = "designer1"
+path = "src/bin/designer1.rs"
 
 [[bin]]
 name = "designer1-gui"

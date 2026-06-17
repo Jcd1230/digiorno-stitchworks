@@ -1,5 +1,6 @@
 use crate::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use crate::model::{Design, InputYAxis, SignatureMode, StitchCommand};
+use crate::preview::{DESIGNER1_PALETTE, quantized_thread_index};
 use crate::shv::{OFFICIAL_NOTICE, ShvOptions, ZERO_NOTICE, build_shv, validate_generated_shv};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -11,46 +12,34 @@ const MAX_MENU_DESIGNS: usize = 6;
 const MENU_DIR: &str = "MENU_01";
 const MENU_FILE: &str = "MENU_01.MHV";
 const ROOT_MENU_FILE: &str = "MENU_SEL.PHV";
-const PREVIEW_WIDTH: u8 = 96;
-const PREVIEW_HEIGHT: u8 = 24;
-
+const EXTRA_MENU_DIRS: [&str; 3] = ["MENU_02", "MENU_03", "MENU_04"];
 const PHV_BITMAP_WIDTH: usize = 173;
 const PHV_BITMAP_HEIGHT: usize = 181;
 const PHV_BITMAP_OFFSET: usize = 0x04fb;
+const PHV_HITBOX_BLOCK: [u8; 21] = [
+    0x01, 0x1a, 0x78, 0x1d, 0x17, 0x01, 0x1a, 0x52, 0x1d, 0x17, 0x00, 0x1a, 0x2c, 0x1d, 0x17,
+    0x00, 0x1a, 0x06, 0x1d, 0x17, 0x00,
+];
 const MHV_BITMAP_WIDTH: usize = 244;
 const MHV_BITMAP_HEIGHT: usize = 238;
 const MHV_BITMAP_OFFSET: usize = 0x013f;
-const MHV_SCREEN_WIDTH: usize = MHV_BITMAP_HEIGHT;
-const MHV_SCREEN_HEIGHT: usize = MHV_BITMAP_WIDTH;
+const MHV_LOGICAL_WIDTH: usize = MHV_BITMAP_HEIGHT;
+const MHV_LOGICAL_HEIGHT: usize = MHV_BITMAP_WIDTH;
+const MHV_SCREEN_WIDTH: usize = MHV_BITMAP_WIDTH;
+const MHV_SCREEN_HEIGHT: usize = MHV_BITMAP_HEIGHT;
 const MHV_GRID_COLS: usize = 3;
 const MHV_GRID_ROWS: usize = 2;
-const MHV_GRID_CELL_W: usize = MHV_SCREEN_WIDTH / MHV_GRID_COLS;
-const MHV_GRID_CELL_H: usize = MHV_SCREEN_HEIGHT / MHV_GRID_ROWS;
+const MHV_GRID_CELL_W: usize = MHV_LOGICAL_WIDTH / MHV_GRID_COLS;
+const MHV_GRID_CELL_H: usize = MHV_LOGICAL_HEIGHT / MHV_GRID_ROWS;
 const MHV_GRID_THUMB_W: usize = 72;
 const MHV_GRID_THUMB_H: usize = 72;
 const MHV_GRID_LINE_VALUE: u8 = 0x5;
 const MHV_TEXT_VALUE: u8 = 0x1;
+const MHV_DEBUG_LABEL: &str = "6 COLORS";
 
 pub const MHV_PREVIEW_WIDTH: usize = MHV_SCREEN_WIDTH;
 pub const MHV_PREVIEW_HEIGHT: usize = MHV_SCREEN_HEIGHT;
-pub const MHV_PREVIEW_PALETTE: [[u8; 3]; 16] = [
-    [245, 245, 245],
-    [15, 15, 18],
-    [210, 42, 42],
-    [38, 88, 210],
-    [40, 150, 75],
-    [0, 190, 210],
-    [230, 190, 20],
-    [230, 0, 190],
-    [120, 70, 200],
-    [230, 110, 20],
-    [0, 120, 130],
-    [160, 35, 75],
-    [95, 95, 95],
-    [20, 170, 210],
-    [90, 140, 20],
-    [30, 70, 190],
-];
+pub const MHV_PREVIEW_PALETTE: [[u8; 3]; 16] = DESIGNER1_PALETTE;
 
 #[derive(Debug, Clone)]
 pub struct DiskExportOptions {
@@ -60,6 +49,7 @@ pub struct DiskExportOptions {
     pub input_y_axis: InputYAxis,
     pub disk_title: String,
     pub menu_label: String,
+    pub show_color_debug: bool,
 }
 
 impl Default for DiskExportOptions {
@@ -71,6 +61,7 @@ impl Default for DiskExportOptions {
             input_y_axis: InputYAxis::Down,
             disk_title: "Designer 1 Disk".to_owned(),
             menu_label: "Menu 1".to_owned(),
+            show_color_debug: false,
         }
     }
 }
@@ -163,8 +154,6 @@ pub fn export_single_menu_disk(
             &ShvOptions {
                 name: Some(input.label.clone()),
                 signature: options.signature,
-                preview_width: PREVIEW_WIDTH,
-                preview_height: PREVIEW_HEIGHT,
             },
         )?;
         let report = validate_generated_shv(&shv)?;
@@ -184,6 +173,19 @@ pub fn export_single_menu_disk(
     fs::write(&mhv_path, build_mhv(options, &designs)?)
         .with_context(|| format!("writing {}", mhv_path.display()))?;
     written_files.push(mhv_path);
+
+    for (menu_idx, menu_dir_name) in EXTRA_MENU_DIRS.iter().enumerate() {
+        let extra_menu_dir = root_dir.join(menu_dir_name);
+        fs::create_dir_all(&extra_menu_dir)
+            .with_context(|| format!("creating menu directory {}", extra_menu_dir.display()))?;
+        let extra_menu_file = extra_menu_dir.join(format!("{menu_dir_name}.MHV"));
+        fs::write(
+            &extra_menu_file,
+            build_mhv_for_label(options, &[], &menu_label_for_index(options, menu_idx + 1))?,
+        )
+            .with_context(|| format!("writing {}", extra_menu_file.display()))?;
+        written_files.push(extra_menu_file);
+    }
 
     let phv_path = root_dir.join(ROOT_MENU_FILE);
     fs::write(&phv_path, build_phv(options)?)
@@ -270,10 +272,26 @@ fn menu_label_for_design(design: &Design) -> String {
     }
 }
 
+fn menu_label_for_index(options: &DiskExportOptions, menu_index: usize) -> String {
+    if menu_index == 0 {
+        options.menu_label.clone()
+    } else {
+        format!("Menu {}", menu_index + 1)
+    }
+}
+
 fn build_mhv(options: &DiskExportOptions, designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
+    build_mhv_for_label(options, designs, &options.menu_label)
+}
+
+fn build_mhv_for_label(
+    options: &DiskExportOptions,
+    designs: &[DiskDesignInput],
+    menu_label: &str,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(signature_bytes(options.signature));
-    let menu_labels = vec![options.menu_label.clone(); 16];
+    let menu_labels = vec![menu_label.to_owned(); 16];
     for label in padded_label_slots(&menu_labels, 12, 16) {
         out.extend_from_slice(&label);
     }
@@ -288,7 +306,7 @@ fn build_mhv(options: &DiskExportOptions, designs: &[DiskDesignInput]) -> Result
     debug_assert_eq!(out.len(), MHV_BITMAP_OFFSET - 2);
     out.push(MHV_BITMAP_HEIGHT as u8);
     out.push(MHV_BITMAP_WIDTH as u8);
-    out.extend_from_slice(&render_mhv_bitmap(designs)?);
+    out.extend_from_slice(&render_mhv_bitmap(designs, options.show_color_debug)?);
     Ok(out)
 }
 
@@ -306,20 +324,13 @@ fn build_phv(options: &DiskExportOptions) -> Result<Vec<u8>> {
     let menu_meta = [[0x39, 0x82], [0x39, 0x5c], [0x39, 0x36], [0x39, 0x10]];
     for (idx, meta) in menu_meta.iter().enumerate() {
         out.extend_from_slice(meta);
-        let labels = if idx == 0 {
-            vec![options.menu_label.clone(); 16]
-        } else {
-            vec![String::new(); 16]
-        };
+        let labels = vec![menu_label_for_index(options, idx); 16];
         for label in padded_label_slots(&labels, 12, 16) {
             out.extend_from_slice(&label);
         }
     }
-    out.extend_from_slice(&[
-        0x00, 0x00, 120, 0x00, 0x00, 0x00, 0x00, 82, 0x00, 0x00, 0x00, 0x00, 44, 0x00, 0x00, 0x00,
-        0x00, 6, 0x00, 0x00,
-    ]);
-    out.push(0x00);
+    // Known-good disks use a fixed 21-byte root-menu hitbox layout block here.
+    out.extend_from_slice(&PHV_HITBOX_BLOCK);
     debug_assert_eq!(out.len(), PHV_BITMAP_OFFSET - 2);
     out.push(PHV_BITMAP_HEIGHT as u8);
     out.push(PHV_BITMAP_WIDTH as u8);
@@ -384,17 +395,26 @@ fn render_text_bitmap(
     pack_4bpp(&pixels, width, height)
 }
 
-pub fn render_mhv_preview_pixels(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
-    let mut pixels = vec![0u8; MHV_SCREEN_WIDTH * MHV_SCREEN_HEIGHT];
-    draw_mhv_grid(&mut pixels);
+pub fn render_mhv_preview_pixels(
+    designs: &[DiskDesignInput],
+    show_color_debug: bool,
+) -> Result<Vec<u8>> {
+    let mut pixels = vec![0u8; MHV_LOGICAL_WIDTH * MHV_LOGICAL_HEIGHT];
+    draw_mhv_grid(&mut pixels, MHV_LOGICAL_WIDTH, MHV_LOGICAL_HEIGHT);
 
-    for (idx, design) in designs.iter().take(MAX_MENU_DESIGNS).enumerate() {
+    for (idx, design) in designs
+        .iter()
+        .take(MAX_MENU_DESIGNS.saturating_sub(1))
+        .enumerate()
+    {
         let col = idx % MHV_GRID_COLS;
         let row = idx / MHV_GRID_COLS;
         let cell_x = col * MHV_GRID_CELL_W;
         let cell_y = row * MHV_GRID_CELL_H;
         draw_menu_design_thumbnail(
             &mut pixels,
+            MHV_LOGICAL_WIDTH,
+            MHV_LOGICAL_HEIGHT,
             &design.design,
             cell_x,
             cell_y,
@@ -404,8 +424,8 @@ pub fn render_mhv_preview_pixels(designs: &[DiskDesignInput]) -> Result<Vec<u8>>
         let label = format!("{} {}", design.slot, design.label);
         draw_text(
             &mut pixels,
-            MHV_SCREEN_WIDTH,
-            MHV_SCREEN_HEIGHT,
+            MHV_LOGICAL_WIDTH,
+            MHV_LOGICAL_HEIGHT,
             cell_x + 6,
             cell_y + MHV_GRID_CELL_H - 14,
             &label,
@@ -413,32 +433,54 @@ pub fn render_mhv_preview_pixels(designs: &[DiskDesignInput]) -> Result<Vec<u8>>
         );
     }
 
-    Ok(pixels)
+    if show_color_debug {
+        let debug_cell = MAX_MENU_DESIGNS - 1;
+        let debug_col = debug_cell % MHV_GRID_COLS;
+        let debug_row = debug_cell / MHV_GRID_COLS;
+        let debug_x = debug_col * MHV_GRID_CELL_W;
+        let debug_y = debug_row * MHV_GRID_CELL_H;
+        draw_color_debug_tile(
+            &mut pixels,
+            MHV_LOGICAL_WIDTH,
+            MHV_LOGICAL_HEIGHT,
+            debug_x,
+            debug_y,
+            MHV_GRID_CELL_W,
+            MHV_GRID_CELL_H,
+        );
+    }
+
+    Ok(rotate_pixels_clockwise(
+        &pixels,
+        MHV_LOGICAL_WIDTH,
+        MHV_LOGICAL_HEIGHT,
+    ))
 }
 
-fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
-    let pixels = render_mhv_preview_pixels(designs)?;
-    let rotated = rotate_clockwise(&pixels, MHV_SCREEN_WIDTH, MHV_SCREEN_HEIGHT);
-    Ok(pack_4bpp(&rotated, MHV_BITMAP_WIDTH, MHV_BITMAP_HEIGHT))
+fn render_mhv_bitmap(designs: &[DiskDesignInput], show_color_debug: bool) -> Result<Vec<u8>> {
+    let pixels = render_mhv_preview_pixels(designs, show_color_debug)?;
+    Ok(pack_4bpp(&pixels, MHV_BITMAP_WIDTH, MHV_BITMAP_HEIGHT))
 }
 
-fn draw_mhv_grid(pixels: &mut [u8]) {
+fn draw_mhv_grid(pixels: &mut [u8], width: usize, height: usize) {
     for row in 1..MHV_GRID_ROWS {
         let y = row * MHV_GRID_CELL_H;
-        for x in 0..MHV_SCREEN_WIDTH {
-            pixels[y * MHV_SCREEN_WIDTH + x] = MHV_GRID_LINE_VALUE;
+        for x in 0..width {
+            pixels[y * width + x] = MHV_GRID_LINE_VALUE;
         }
     }
     for col in 1..MHV_GRID_COLS {
         let x = col * MHV_GRID_CELL_W;
-        for y in 0..MHV_SCREEN_HEIGHT {
-            pixels[y * MHV_SCREEN_WIDTH + x] = MHV_GRID_LINE_VALUE;
+        for y in 0..height {
+            pixels[y * width + x] = MHV_GRID_LINE_VALUE;
         }
     }
 }
 
 fn draw_menu_design_thumbnail(
     dest: &mut [u8],
+    width: usize,
+    height: usize,
     design: &Design,
     cell_x: usize,
     cell_y: usize,
@@ -491,9 +533,9 @@ fn draw_menu_design_thumbnail(
             StitchCommand::Stitch => {
                 let pt = to_pixel(point.x, point.y);
                 if let Some(prev_pt) = prev {
-                    draw_indexed_line(dest, prev_pt.0, prev_pt.1, pt.0, pt.1, current_value);
+                    draw_indexed_line(dest, width, height, prev_pt.0, prev_pt.1, pt.0, pt.1, current_value);
                 } else {
-                    set_indexed_pixel(dest, pt.0, pt.1, current_value);
+                    set_indexed_pixel(dest, width, height, pt.0, pt.1, current_value);
                 }
                 prev = Some(pt);
             }
@@ -509,54 +551,163 @@ fn draw_menu_design_thumbnail(
     }
 }
 
+fn draw_color_debug_tile(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    cell_x: usize,
+    cell_y: usize,
+    cell_w: usize,
+    cell_h: usize,
+) {
+    let box_cols = 4;
+    let box_rows = 4;
+    let inner_left = cell_x + 6;
+    let inner_top = cell_y + 6;
+    let inner_w = cell_w.saturating_sub(12);
+    let inner_h = cell_h.saturating_sub(26);
+    let box_w = (inner_w / box_cols).max(1);
+    let box_h = (inner_h / box_rows).max(1);
+
+    for idx in 0..16usize {
+        let col = idx % box_cols;
+        let row = idx / box_cols;
+        let x0 = inner_left + col * box_w;
+        let y0 = inner_top + row * box_h;
+        let x1 = (x0 + box_w).min(cell_x + cell_w - 1);
+        let y1 = (y0 + box_h).min(cell_y + cell_h - 15);
+        fill_rect(pixels, width, height, x0, y0, x1, y1, idx as u8);
+        stroke_rect(
+            pixels,
+            width,
+            height,
+            x0,
+            y0,
+            x1,
+            y1,
+            MHV_GRID_LINE_VALUE,
+        );
+        let text_value = if idx == MHV_TEXT_VALUE as usize { 0x0f } else { MHV_TEXT_VALUE };
+        draw_text(
+            pixels,
+            width,
+            height,
+            x0 + 2,
+            y0 + 2,
+            &format!("{idx:X}"),
+            text_value,
+        );
+    }
+
+    draw_text(
+        pixels,
+        width,
+        height,
+        cell_x + 6,
+        cell_y + cell_h - 14,
+        MHV_DEBUG_LABEL,
+        MHV_TEXT_VALUE,
+    );
+}
+
 fn thread_palette_value(design: &Design, index: usize) -> u8 {
-    let Some(thread) = design.threads.get(index).or_else(|| design.threads.first()) else {
-        return 0x0f;
-    };
-    let Some(rgb) = parse_hex_rgb(thread.color.as_deref()) else {
-        return 0x0f;
-    };
-    nearest_palette_value(rgb)
+    quantized_thread_index(design, index)
 }
 
-fn parse_hex_rgb(value: Option<&str>) -> Option<[u8; 3]> {
-    let mut s = value?.trim();
-    if let Some(stripped) = s.strip_prefix('#') {
-        s = stripped;
-    }
-    if s.len() != 6 {
-        return None;
-    }
-    Some([
-        u8::from_str_radix(&s[0..2], 16).ok()?,
-        u8::from_str_radix(&s[2..4], 16).ok()?,
-        u8::from_str_radix(&s[4..6], 16).ok()?,
-    ])
-}
-
-fn nearest_palette_value(rgb: [u8; 3]) -> u8 {
-    MHV_PREVIEW_PALETTE
-        .iter()
-        .enumerate()
-        .skip(2)
-        .filter(|(idx, _)| *idx != MHV_GRID_LINE_VALUE as usize)
-        .min_by_key(|(_, color)| {
-            let dr = rgb[0] as i32 - color[0] as i32;
-            let dg = rgb[1] as i32 - color[1] as i32;
-            let db = rgb[2] as i32 - color[2] as i32;
-            dr * dr + dg * dg + db * db
-        })
-        .map(|(idx, _)| idx as u8)
-        .unwrap_or(0x0f)
-}
-
-fn set_indexed_pixel(pixels: &mut [u8], x: i32, y: i32, value: u8) {
-    if x >= 0 && y >= 0 && (x as usize) < MHV_SCREEN_WIDTH && (y as usize) < MHV_SCREEN_HEIGHT {
-        pixels[y as usize * MHV_SCREEN_WIDTH + x as usize] = value;
+fn set_indexed_pixel(pixels: &mut [u8], width: usize, height: usize, x: i32, y: i32, value: u8) {
+    if x >= 0 && y >= 0 {
+        let x = x as usize;
+        let y = y as usize;
+        if x < width && y < height {
+            pixels[y * width + x] = value;
+        }
     }
 }
 
-fn draw_indexed_line(pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, value: u8) {
+fn fill_rect(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    value: u8,
+) {
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for y in y0..y1 {
+        if y >= height {
+            break;
+        }
+        for x in x0..x1 {
+            if x >= width {
+                break;
+            }
+            pixels[y * width + x] = value;
+        }
+    }
+}
+
+fn stroke_rect(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    value: u8,
+) {
+    if x0 >= width || y0 >= height || x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for x in x0..x1 {
+        if x < width {
+            if y0 < height {
+                pixels[y0 * width + x] = value;
+            }
+            if y1 > 0 && y1 - 1 < height {
+                pixels[(y1 - 1) * width + x] = value;
+            }
+        }
+    }
+    for y in y0..y1 {
+        if y < height {
+            if x0 < width {
+                pixels[y * width + x0] = value;
+            }
+            if x1 > 0 && x1 - 1 < width {
+                pixels[y * width + (x1 - 1)] = value;
+            }
+        }
+    }
+}
+
+fn rotate_pixels_clockwise(src: &[u8], src_width: usize, src_height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; src.len()];
+    let dest_width = src_height;
+    for y in 0..src_height {
+        for x in 0..src_width {
+            let dest_x = src_height - 1 - y;
+            let dest_y = x;
+            out[dest_y * dest_width + dest_x] = src[y * src_width + x];
+        }
+    }
+    out
+}
+
+fn draw_indexed_line(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    value: u8,
+) {
     let dx = (x1 - x0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let dy = -(y1 - y0).abs();
@@ -564,7 +715,7 @@ fn draw_indexed_line(pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i
     let mut err = dx + dy;
 
     loop {
-        set_indexed_pixel(pixels, x0, y0, value);
+        set_indexed_pixel(pixels, width, height, x0, y0, value);
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -578,18 +729,6 @@ fn draw_indexed_line(pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i
             y0 += sy;
         }
     }
-}
-
-fn rotate_clockwise(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut out = vec![0u8; pixels.len()];
-    for y in 0..height {
-        for x in 0..width {
-            let dst_x = height - 1 - y;
-            let dst_y = x;
-            out[dst_y * height + dst_x] = pixels[y * width + x];
-        }
-    }
-    out
 }
 
 fn draw_text(
@@ -735,9 +874,17 @@ mod tests {
 
     #[test]
     fn mhv_preview_uses_thread_colors_and_black_labels() {
-        let pixels = render_mhv_preview_pixels(&[sample_disk_design(1, "One")]).unwrap();
+        let pixels = render_mhv_preview_pixels(&[sample_disk_design(1, "One")], false).unwrap();
         assert!(pixels.contains(&MHV_TEXT_VALUE));
-        assert!(pixels.contains(&0x7));
+        assert!(pixels.iter().any(|&value| value > 1));
+    }
+
+    #[test]
+    fn mhv_preview_includes_color_debug_tile() {
+        let pixels = render_mhv_preview_pixels(&[], true).unwrap();
+        for idx in 0..16u8 {
+            assert!(pixels.contains(&idx), "missing palette index {idx}");
+        }
     }
 
     #[test]
@@ -774,6 +921,9 @@ mod tests {
         assert!(dir.join(MENU_DIR).join(MENU_FILE).is_file());
         assert!(dir.join(MENU_DIR).join("DES01_01.SHV").is_file());
         assert!(dir.join(MENU_DIR).join("DES01_02.SHV").is_file());
+        assert!(dir.join("MENU_02").join("MENU_02.MHV").is_file());
+        assert!(dir.join("MENU_03").join("MENU_03.MHV").is_file());
+        assert!(dir.join("MENU_04").join("MENU_04.MHV").is_file());
         assert_eq!(report.designs[0].label, "Alpha");
         assert_eq!(report.designs[1].label, "Beta");
 
