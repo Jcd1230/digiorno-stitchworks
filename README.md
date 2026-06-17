@@ -6,6 +6,8 @@ This project focuses on practical interoperability with real Designer 1 hardware
 
 ![Designer 1 GUI screenshot](docs/screenshot.png)
 
+![Designer 1 Gotek Emulator Picture](docs/deskshot.png)
+
 ## Features
 
 - Convert Ink/Stitch JSON into Designer 1 `SHV` files.
