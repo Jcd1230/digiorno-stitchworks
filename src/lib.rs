@@ -7,6 +7,7 @@
 //! - [`model`] contains the shared domain model.
 
 pub mod disk;
+pub mod gotek;
 pub mod inkstitch;
 pub mod model;
 pub mod preview;
