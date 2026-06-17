@@ -1,5 +1,6 @@
 use crate::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use crate::model::{Design, InputYAxis, SignatureMode};
+use crate::preview::render_preview_4bpp;
 use crate::shv::{OFFICIAL_NOTICE, ShvOptions, ZERO_NOTICE, build_shv, validate_generated_shv};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -7,7 +8,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_MENU_DESIGNS: usize = 16;
+const MAX_MENU_DESIGNS: usize = 6;
 const MENU_DIR: &str = "MENU_01";
 const MENU_FILE: &str = "MENU_01.MHV";
 const ROOT_MENU_FILE: &str = "MENU_SEL.PHV";
@@ -20,6 +21,14 @@ const PHV_BITMAP_OFFSET: usize = 0x04fb;
 const MHV_BITMAP_WIDTH: usize = 244;
 const MHV_BITMAP_HEIGHT: usize = 238;
 const MHV_BITMAP_OFFSET: usize = 0x013f;
+const MHV_GRID_COLS: usize = 3;
+const MHV_GRID_ROWS: usize = 2;
+const MHV_GRID_CELL_W: usize = MHV_BITMAP_WIDTH / MHV_GRID_COLS;
+const MHV_GRID_CELL_H: usize = MHV_BITMAP_HEIGHT / MHV_GRID_ROWS;
+const MHV_GRID_THUMB_W: usize = 72;
+const MHV_GRID_THUMB_H: usize = 72;
+const MHV_GRID_LINE_VALUE: u8 = 0x5;
+const MHV_THUMB_VALUE: u8 = 0x0f;
 
 #[derive(Debug, Clone)]
 pub struct DiskExportOptions {
@@ -149,9 +158,8 @@ pub fn export_single_menu_disk(
         });
     }
 
-    let labels: Vec<String> = designs.iter().map(|d| d.label.clone()).collect();
     let mhv_path = menu_dir.join(MENU_FILE);
-    fs::write(&mhv_path, build_mhv(options, &labels)?)
+    fs::write(&mhv_path, build_mhv(options, &designs)?)
         .with_context(|| format!("writing {}", mhv_path.display()))?;
     written_files.push(mhv_path);
 
@@ -240,15 +248,16 @@ fn menu_label_for_design(design: &Design) -> String {
     }
 }
 
-fn build_mhv(options: &DiskExportOptions, design_labels: &[String]) -> Result<Vec<u8>> {
+fn build_mhv(options: &DiskExportOptions, designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(signature_bytes(options.signature));
-    for label in padded_label_slots(design_labels, 12, MAX_MENU_DESIGNS) {
+    let menu_labels = vec![options.menu_label.clone(); 16];
+    for label in padded_label_slots(&menu_labels, 12, 16) {
         out.extend_from_slice(&label);
     }
     out.extend_from_slice(&[0x77, 0xfb, 0x06]);
     for idx in 0..36 {
-        out.push(if idx < design_labels.len() {
+        out.push(if idx < designs.len() {
             (idx + 1) as u8
         } else {
             0
@@ -257,13 +266,7 @@ fn build_mhv(options: &DiskExportOptions, design_labels: &[String]) -> Result<Ve
     debug_assert_eq!(out.len(), MHV_BITMAP_OFFSET - 2);
     out.push(MHV_BITMAP_HEIGHT as u8);
     out.push(MHV_BITMAP_WIDTH as u8);
-    out.extend_from_slice(&render_text_bitmap(
-        MHV_BITMAP_WIDTH,
-        MHV_BITMAP_HEIGHT,
-        design_labels,
-        10,
-        10,
-    ));
+    out.extend_from_slice(&render_mhv_bitmap(designs)?);
     Ok(out)
 }
 
@@ -357,6 +360,84 @@ fn render_text_bitmap(
         draw_text(&mut pixels, width, height, left, y, label, 0x7);
     }
     pack_4bpp(&pixels, width, height)
+}
+
+fn render_mhv_bitmap(designs: &[DiskDesignInput]) -> Result<Vec<u8>> {
+    let mut pixels = vec![0u8; MHV_BITMAP_WIDTH * MHV_BITMAP_HEIGHT];
+    draw_mhv_grid(&mut pixels);
+
+    for (idx, design) in designs.iter().take(MAX_MENU_DESIGNS).enumerate() {
+        let col = idx % MHV_GRID_COLS;
+        let row = idx / MHV_GRID_COLS;
+        let cell_x = col * MHV_GRID_CELL_W;
+        let cell_y = row * MHV_GRID_CELL_H;
+        let thumb = render_preview_4bpp(
+            &design.design,
+            MHV_GRID_THUMB_W as u8,
+            MHV_GRID_THUMB_H as u8,
+            MHV_THUMB_VALUE,
+        )?;
+        blit_thumb_4bpp(
+            &mut pixels,
+            cell_x + (MHV_GRID_CELL_W - MHV_GRID_THUMB_W) / 2,
+            cell_y + 12,
+            MHV_GRID_THUMB_W,
+            MHV_GRID_THUMB_H,
+            &thumb,
+        );
+        let label = format!("{:02}", design.slot);
+        draw_text(
+            &mut pixels,
+            MHV_BITMAP_WIDTH,
+            MHV_BITMAP_HEIGHT,
+            cell_x + 6,
+            cell_y + MHV_GRID_CELL_H - 14,
+            &label,
+            0x7,
+        );
+    }
+
+    Ok(pack_4bpp(&pixels, MHV_BITMAP_WIDTH, MHV_BITMAP_HEIGHT))
+}
+
+fn draw_mhv_grid(pixels: &mut [u8]) {
+    for row in 1..MHV_GRID_ROWS {
+        let y = row * MHV_GRID_CELL_H;
+        for x in 0..MHV_BITMAP_WIDTH {
+            pixels[y * MHV_BITMAP_WIDTH + x] = MHV_GRID_LINE_VALUE;
+        }
+    }
+    for col in 1..MHV_GRID_COLS {
+        let x = col * MHV_GRID_CELL_W;
+        for y in 0..MHV_BITMAP_HEIGHT {
+            pixels[y * MHV_BITMAP_WIDTH + x] = MHV_GRID_LINE_VALUE;
+        }
+    }
+}
+
+fn blit_thumb_4bpp(
+    dest: &mut [u8],
+    dst_x: usize,
+    dst_y: usize,
+    width: usize,
+    height: usize,
+    packed: &[u8],
+) {
+    let stride = width.div_ceil(2);
+    for y in 0..height {
+        for x in 0..width {
+            let byte = packed[y * stride + x / 2];
+            let value = if x % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+            if value == 0 {
+                continue;
+            }
+            let px = dst_x + x;
+            let py = dst_y + y;
+            if px < MHV_BITMAP_WIDTH && py < MHV_BITMAP_HEIGHT {
+                dest[py * MHV_BITMAP_WIDTH + px] = value;
+            }
+        }
+    }
 }
 
 fn draw_text(
@@ -477,13 +558,22 @@ mod tests {
     #[test]
     fn generated_menu_lengths_match_documented_offsets() {
         let options = DiskExportOptions::default();
-        let mhv = build_mhv(&options, &["One".to_owned(), "Two".to_owned()]).unwrap();
+        let mhv = build_mhv(
+            &options,
+            &[
+                sample_disk_design(1, "One"),
+                sample_disk_design(2, "Two"),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             mhv.len(),
             MHV_BITMAP_OFFSET + MHV_BITMAP_HEIGHT * MHV_BITMAP_WIDTH.div_ceil(2)
         );
         assert_eq!(mhv[MHV_BITMAP_OFFSET - 2], MHV_BITMAP_HEIGHT as u8);
         assert_eq!(mhv[MHV_BITMAP_OFFSET - 1], MHV_BITMAP_WIDTH as u8);
+        assert_eq!(&mhv[0x0116..0x0119], &[0x77, 0xfb, 0x06]);
+        assert_eq!(&mhv[0x0119..0x011d], &[0x01, 0x02, 0x00, 0x00]);
 
         let phv = build_phv(&options).unwrap();
         assert_eq!(
@@ -507,11 +597,11 @@ mod tests {
     fn export_rejects_more_than_sixteen_json_files() {
         let dir = temp_test_dir("too_many");
         fs::create_dir_all(&dir).unwrap();
-        for idx in 0..17 {
+        for idx in 0..7 {
             fs::write(dir.join(format!("{idx:02}.json")), "{}").unwrap();
         }
         let err = export_single_menu_disk(&dir, &DiskExportOptions::default()).unwrap_err();
-        assert!(err.to_string().contains("at most 16"));
+        assert!(err.to_string().contains("at most 6"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -562,5 +652,49 @@ mod tests {
   ]
 }}"##
         )
+    }
+
+    fn sample_disk_design(slot: u8, name: &str) -> DiskDesignInput {
+        DiskDesignInput {
+            slot,
+            source: PathBuf::from(format!("{name}.json")),
+            label: name.to_owned(),
+            design: Design {
+                name: name.to_owned(),
+                threads: vec![],
+                points: vec![
+                    crate::model::StitchPoint {
+                        x: 0,
+                        y: 0,
+                        command: crate::model::StitchCommand::Jump,
+                    },
+                    crate::model::StitchPoint {
+                        x: 0,
+                        y: 0,
+                        command: crate::model::StitchCommand::Stitch,
+                    },
+                    crate::model::StitchPoint {
+                        x: 30,
+                        y: 0,
+                        command: crate::model::StitchCommand::Stitch,
+                    },
+                    crate::model::StitchPoint {
+                        x: 30,
+                        y: 30,
+                        command: crate::model::StitchCommand::Stitch,
+                    },
+                    crate::model::StitchPoint {
+                        x: 0,
+                        y: 30,
+                        command: crate::model::StitchCommand::Stitch,
+                    },
+                    crate::model::StitchPoint {
+                        x: 0,
+                        y: 0,
+                        command: crate::model::StitchCommand::End,
+                    },
+                ],
+            },
+        }
     }
 }

@@ -171,25 +171,6 @@ impl eframe::App for Designer1App {
                     self.rebuild_current();
                 }
 
-                ui.separator();
-                ui.heading("Path view");
-                ui.checkbox(&mut self.show_cm_grid, "Show 1 cm grid");
-                ui.checkbox(&mut self.show_jumps, "Show jump stitches");
-                ui.horizontal(|ui| {
-                    if ui.button("Reset view").clicked() {
-                        self.path_zoom = 1.0;
-                        self.path_pan = Vec2::ZERO;
-                    }
-                    ui.label(format!("Zoom {:.0}%", self.path_zoom * 100.0));
-                });
-
-                ui.separator();
-                ui.heading("Status");
-                ui.label(&self.status);
-                if let Some(error) = &self.error {
-                    ui.colored_label(Color32::from_rgb(190, 40, 40), error);
-                }
-
                 if let Some(design) = &self.design {
                     ui.separator();
                     ui.heading("Design stats");
@@ -244,34 +225,6 @@ impl eframe::App for Designer1App {
                     }
                 }
 
-                if let Some(report) = &self.report {
-                    ui.separator();
-                    ui.heading("SHV readback");
-                    egui::Grid::new("readback_grid")
-                        .num_columns(2)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("SHV name");
-                            ui.monospace(&report.name);
-                            ui.end_row();
-                            ui.label("Colors");
-                            ui.label(report.color_count.to_string());
-                            ui.end_row();
-                            ui.label("Records");
-                            ui.label(report.total_records.to_string());
-                            ui.end_row();
-                            ui.label("Stitch bytes");
-                            ui.label(report.stitch_bytes.to_string());
-                            ui.end_row();
-                            ui.label("Final position");
-                            ui.monospace(format!(
-                                "{}, {}",
-                                report.final_position.x, report.final_position.y
-                            ));
-                            ui.end_row();
-                        });
-                }
-
                 ui.separator();
                 ui.heading("Embedded SHV thumbnail preview");
                 if let Some(design) = &self.design {
@@ -284,17 +237,22 @@ impl eframe::App for Designer1App {
                 } else {
                     ui.label("No preview built.");
                 }
+
+                ui.separator();
+                ui.heading("Status");
+                ui.label(&self.status);
+                if let Some(error) = &self.error {
+                    ui.colored_label(Color32::from_rgb(190, 40, 40), error);
+                }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Normalized stitch path");
-            ui.add_space(6.0);
             if let Some(design) = &self.design {
                 draw_design_path(
                     ui,
                     design,
-                    self.show_cm_grid,
-                    self.show_jumps,
+                    &mut self.show_cm_grid,
+                    &mut self.show_jumps,
                     &mut self.path_zoom,
                     &mut self.path_pan,
                 );
@@ -509,8 +467,8 @@ impl Designer1App {
 fn draw_design_path(
     ui: &mut egui::Ui,
     design: &Design,
-    show_cm_grid: bool,
-    show_jumps: bool,
+    show_cm_grid: &mut bool,
+    show_jumps: &mut bool,
     zoom: &mut f32,
     pan: &mut Vec2,
 ) {
@@ -550,7 +508,33 @@ fn draw_design_path(
         }
     }
 
-    if show_cm_grid {
+    egui::Area::new(ui.id().with("path_view_toolbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.right_top() + Vec2::new(-8.0, 8.0))
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_premultiplied(255, 255, 255, 225))
+                .stroke(Stroke::new(1.0, Color32::from_gray(210)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(*show_jumps, "Show Jumps").clicked() {
+                            *show_jumps = !*show_jumps;
+                        }
+                        if ui.selectable_label(*show_cm_grid, "Show Grid").clicked() {
+                            *show_cm_grid = !*show_cm_grid;
+                        }
+                        if ui.button("Reset View").clicked() {
+                            *zoom = 1.0;
+                            *pan = Vec2::ZERO;
+                        }
+                    });
+                });
+        });
+
+    if *show_cm_grid {
         draw_cm_grid(
             &painter,
             rect,
@@ -570,7 +554,7 @@ fn draw_design_path(
             StitchCommand::End => break,
             StitchCommand::Jump | StitchCommand::Trim => {
                 let pos = map(p.x, p.y);
-                if show_jumps {
+                if *show_jumps {
                     if let Some(prev_pos) = prev {
                         draw_dotted_line(
                             &painter,
