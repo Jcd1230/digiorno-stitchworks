@@ -1,6 +1,5 @@
 use crate::inkstitch::{LoadOptions, load_inkstitch_json_file};
-use crate::model::{Design, InputYAxis, SignatureMode};
-use crate::preview::render_preview_4bpp;
+use crate::model::{Design, InputYAxis, SignatureMode, StitchCommand};
 use crate::shv::{OFFICIAL_NOTICE, ShvOptions, ZERO_NOTICE, build_shv, validate_generated_shv};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -30,10 +29,28 @@ const MHV_GRID_CELL_H: usize = MHV_SCREEN_HEIGHT / MHV_GRID_ROWS;
 const MHV_GRID_THUMB_W: usize = 72;
 const MHV_GRID_THUMB_H: usize = 72;
 const MHV_GRID_LINE_VALUE: u8 = 0x5;
-const MHV_THUMB_VALUE: u8 = 0x0f;
+const MHV_TEXT_VALUE: u8 = 0x1;
 
 pub const MHV_PREVIEW_WIDTH: usize = MHV_SCREEN_WIDTH;
 pub const MHV_PREVIEW_HEIGHT: usize = MHV_SCREEN_HEIGHT;
+pub const MHV_PREVIEW_PALETTE: [[u8; 3]; 16] = [
+    [245, 245, 245],
+    [15, 15, 18],
+    [210, 42, 42],
+    [38, 88, 210],
+    [40, 150, 75],
+    [0, 190, 210],
+    [230, 190, 20],
+    [230, 0, 190],
+    [120, 70, 200],
+    [230, 110, 20],
+    [0, 120, 130],
+    [160, 35, 75],
+    [95, 95, 95],
+    [20, 170, 210],
+    [90, 140, 20],
+    [30, 70, 190],
+];
 
 #[derive(Debug, Clone)]
 pub struct DiskExportOptions {
@@ -376,21 +393,15 @@ pub fn render_mhv_preview_pixels(designs: &[DiskDesignInput]) -> Result<Vec<u8>>
         let row = idx / MHV_GRID_COLS;
         let cell_x = col * MHV_GRID_CELL_W;
         let cell_y = row * MHV_GRID_CELL_H;
-        let thumb = render_preview_4bpp(
-            &design.design,
-            MHV_GRID_THUMB_W as u8,
-            MHV_GRID_THUMB_H as u8,
-            MHV_THUMB_VALUE,
-        )?;
-        blit_thumb_4bpp(
+        draw_menu_design_thumbnail(
             &mut pixels,
-            cell_x + (MHV_GRID_CELL_W - MHV_GRID_THUMB_W) / 2,
-            cell_y + (MHV_GRID_CELL_H - MHV_GRID_THUMB_H) / 2,
-            MHV_GRID_THUMB_W,
-            MHV_GRID_THUMB_H,
-            &thumb,
+            &design.design,
+            cell_x,
+            cell_y,
+            MHV_GRID_CELL_W,
+            MHV_GRID_CELL_H,
         );
-        let label = design.slot.to_string();
+        let label = format!("{} {}", design.slot, design.label);
         draw_text(
             &mut pixels,
             MHV_SCREEN_WIDTH,
@@ -398,7 +409,7 @@ pub fn render_mhv_preview_pixels(designs: &[DiskDesignInput]) -> Result<Vec<u8>>
             cell_x + 6,
             cell_y + MHV_GRID_CELL_H - 14,
             &label,
-            0x7,
+            MHV_TEXT_VALUE,
         );
     }
 
@@ -426,27 +437,145 @@ fn draw_mhv_grid(pixels: &mut [u8]) {
     }
 }
 
-fn blit_thumb_4bpp(
+fn draw_menu_design_thumbnail(
     dest: &mut [u8],
-    dst_x: usize,
-    dst_y: usize,
-    width: usize,
-    height: usize,
-    packed: &[u8],
+    design: &Design,
+    cell_x: usize,
+    cell_y: usize,
+    cell_w: usize,
+    cell_h: usize,
 ) {
-    let stride = width.div_ceil(2);
-    for y in 0..height {
-        for x in 0..width {
-            let byte = packed[y * stride + x / 2];
-            let value = if x % 2 == 0 { byte >> 4 } else { byte & 0x0f };
-            if value == 0 {
-                continue;
+    let drawable: Vec<_> = design
+        .points
+        .iter()
+        .filter(|p| p.command.is_drawn_stitch())
+        .collect();
+    let (min_x, max_x, min_y, max_y) = if drawable.is_empty() {
+        (0, 1, 0, 1)
+    } else {
+        (
+            drawable.iter().map(|p| p.x).min().unwrap(),
+            drawable.iter().map(|p| p.x).max().unwrap(),
+            drawable.iter().map(|p| p.y).min().unwrap(),
+            drawable.iter().map(|p| p.y).max().unwrap(),
+        )
+    };
+
+    let span_x = (max_x - min_x).max(1) as f64;
+    let span_y = (max_y - min_y).max(1) as f64;
+    let thumb_w = MHV_GRID_THUMB_W.min(cell_w.saturating_sub(10)).max(1);
+    let thumb_h = MHV_GRID_THUMB_H.min(cell_h.saturating_sub(28)).max(1);
+    let scale = ((thumb_w - 1) as f64 / span_x)
+        .min((thumb_h - 1) as f64 / span_y)
+        .max(0.001);
+    let drawn_w = span_x * scale;
+    let drawn_h = span_y * scale;
+    let origin_x = cell_x as f64 + (cell_w as f64 - drawn_w) / 2.0;
+    let origin_y = cell_y as f64 + (cell_h as f64 - 22.0 - drawn_h) / 2.0;
+    let to_pixel = |x: i32, y: i32| -> (i32, i32) {
+        (
+            (origin_x + (x - min_x) as f64 * scale).round() as i32,
+            (origin_y + (max_y - y) as f64 * scale).round() as i32,
+        )
+    };
+
+    let mut prev: Option<(i32, i32)> = None;
+    let mut thread_index = 0usize;
+    let mut current_value = thread_palette_value(design, thread_index);
+    for point in &design.points {
+        match &point.command {
+            StitchCommand::End => break,
+            StitchCommand::Jump | StitchCommand::Trim => {
+                prev = None;
             }
-            let px = dst_x + x;
-            let py = dst_y + y;
-            if px < MHV_SCREEN_WIDTH && py < MHV_SCREEN_HEIGHT {
-                dest[py * MHV_SCREEN_WIDTH + px] = value;
+            StitchCommand::Stitch => {
+                let pt = to_pixel(point.x, point.y);
+                if let Some(prev_pt) = prev {
+                    draw_indexed_line(dest, prev_pt.0, prev_pt.1, pt.0, pt.1, current_value);
+                } else {
+                    set_indexed_pixel(dest, pt.0, pt.1, current_value);
+                }
+                prev = Some(pt);
             }
+            StitchCommand::ColorChange | StitchCommand::Stop => {
+                thread_index = (thread_index + 1).min(design.threads.len().saturating_sub(1));
+                current_value = thread_palette_value(design, thread_index);
+                prev = None;
+            }
+            StitchCommand::Other(_) => {
+                prev = None;
+            }
+        }
+    }
+}
+
+fn thread_palette_value(design: &Design, index: usize) -> u8 {
+    let Some(thread) = design.threads.get(index).or_else(|| design.threads.first()) else {
+        return 0x0f;
+    };
+    let Some(rgb) = parse_hex_rgb(thread.color.as_deref()) else {
+        return 0x0f;
+    };
+    nearest_palette_value(rgb)
+}
+
+fn parse_hex_rgb(value: Option<&str>) -> Option<[u8; 3]> {
+    let mut s = value?.trim();
+    if let Some(stripped) = s.strip_prefix('#') {
+        s = stripped;
+    }
+    if s.len() != 6 {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&s[0..2], 16).ok()?,
+        u8::from_str_radix(&s[2..4], 16).ok()?,
+        u8::from_str_radix(&s[4..6], 16).ok()?,
+    ])
+}
+
+fn nearest_palette_value(rgb: [u8; 3]) -> u8 {
+    MHV_PREVIEW_PALETTE
+        .iter()
+        .enumerate()
+        .skip(2)
+        .filter(|(idx, _)| *idx != MHV_GRID_LINE_VALUE as usize)
+        .min_by_key(|(_, color)| {
+            let dr = rgb[0] as i32 - color[0] as i32;
+            let dg = rgb[1] as i32 - color[1] as i32;
+            let db = rgb[2] as i32 - color[2] as i32;
+            dr * dr + dg * dg + db * db
+        })
+        .map(|(idx, _)| idx as u8)
+        .unwrap_or(0x0f)
+}
+
+fn set_indexed_pixel(pixels: &mut [u8], x: i32, y: i32, value: u8) {
+    if x >= 0 && y >= 0 && (x as usize) < MHV_SCREEN_WIDTH && (y as usize) < MHV_SCREEN_HEIGHT {
+        pixels[y as usize * MHV_SCREEN_WIDTH + x as usize] = value;
+    }
+}
+
+fn draw_indexed_line(pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, value: u8) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        set_indexed_pixel(pixels, x0, y0, value);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
         }
     }
 }
@@ -605,6 +734,13 @@ mod tests {
     }
 
     #[test]
+    fn mhv_preview_uses_thread_colors_and_black_labels() {
+        let pixels = render_mhv_preview_pixels(&[sample_disk_design(1, "One")]).unwrap();
+        assert!(pixels.contains(&MHV_TEXT_VALUE));
+        assert!(pixels.contains(&0x7));
+    }
+
+    #[test]
     fn export_rejects_empty_folder() {
         let dir = temp_test_dir("empty");
         fs::create_dir_all(&dir).unwrap();
@@ -681,7 +817,12 @@ mod tests {
             label: name.to_owned(),
             design: Design {
                 name: name.to_owned(),
-                threads: vec![],
+                threads: vec![crate::model::Thread {
+                    color: Some("#df5bd7".to_owned()),
+                    description: None,
+                    catalog_number: None,
+                    brand: None,
+                }],
                 points: vec![
                     crate::model::StitchPoint {
                         x: 0,

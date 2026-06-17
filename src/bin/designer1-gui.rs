@@ -1,5 +1,5 @@
 use designer1_tools::disk::{
-    DiskDesignInput, DiskExportOptions, MHV_PREVIEW_HEIGHT, MHV_PREVIEW_WIDTH,
+    DiskDesignInput, DiskExportOptions, MHV_PREVIEW_HEIGHT, MHV_PREVIEW_PALETTE, MHV_PREVIEW_WIDTH,
     export_single_menu_disk, load_disk_designs, render_mhv_preview_pixels,
 };
 use designer1_tools::inkstitch::{LoadOptions, load_inkstitch_json_file};
@@ -762,12 +762,11 @@ fn draw_mhv_preview(ui: &mut egui::Ui, pixels: &[u8]) {
 }
 
 fn mhv_preview_color(value: u8) -> Color32 {
-    match value {
-        0x5 => Color32::from_rgb(0, 190, 210),
-        0x7 => Color32::from_rgb(0, 210, 210),
-        0x0f => Color32::from_rgb(30, 70, 190),
-        _ => Color32::from_gray(30),
-    }
+    let [r, g, b] = MHV_PREVIEW_PALETTE
+        .get(value as usize)
+        .copied()
+        .unwrap_or([30, 30, 30]);
+    Color32::from_rgb(r, g, b)
 }
 
 fn draw_thread_thumbnail(ui: &mut egui::Ui, design: &Design, width: usize, height: usize) {
