@@ -1,5 +1,5 @@
 use crate::model::{Design, StitchCommand, StitchPoint};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub const DESIGNER1_PALETTE: [[u8; 3]; 16] = [
     [230, 190, 100],
@@ -85,7 +85,16 @@ pub fn render_preview_4bpp(design: &Design, width: u8, height: u8) -> Result<Vec
             StitchCommand::Stitch => {
                 let pt = to_pixel(p);
                 if let Some(prev_pt) = prev {
-                    draw_line(&mut pixels, width, height, prev_pt.0, prev_pt.1, pt.0, pt.1, color_index);
+                    draw_line(
+                        &mut pixels,
+                        width,
+                        height,
+                        prev_pt.0,
+                        prev_pt.1,
+                        pt.0,
+                        pt.1,
+                        color_index,
+                    );
                 } else {
                     set_pixel(&mut pixels, width, height, pt.0, pt.1, color_index);
                 }
@@ -139,8 +148,7 @@ pub fn render_preview_4bpp_auto(design: &Design) -> Result<(u8, u8, Vec<u8>)> {
     let span_x = (max_x - min_x).max(0);
     let span_y = (max_y - min_y).max(0);
     let width_px = (span_x + SHV_PREVIEW_UNITS_PER_PIXEL - 1) / SHV_PREVIEW_UNITS_PER_PIXEL + 1;
-    let height_px =
-        (span_y + SHV_PREVIEW_UNITS_PER_PIXEL - 1) / SHV_PREVIEW_UNITS_PER_PIXEL + 1;
+    let height_px = (span_y + SHV_PREVIEW_UNITS_PER_PIXEL - 1) / SHV_PREVIEW_UNITS_PER_PIXEL + 1;
     let width = width_px.clamp(1, u8::MAX as i32) as usize;
     let height = height_px.clamp(1, u8::MAX as i32) as usize;
 
@@ -259,7 +267,16 @@ fn set_pixel(pixels: &mut [u8], width: usize, height: usize, x: i32, y: i32, val
     }
 }
 
-fn draw_line(pixels: &mut [u8], width: usize, height: usize, mut x0: i32, mut y0: i32, x1: i32, y1: i32, value: u8) {
+fn draw_line(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    value: u8,
+) {
     let dx = (x1 - x0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let dy = -(y1 - y0).abs();

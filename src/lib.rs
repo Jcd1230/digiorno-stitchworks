@@ -13,11 +13,11 @@
 //! prefer byte comparison against known-good files and on-machine validation over
 //! inference from rendered previews.
 
+pub mod cli;
 pub mod disk;
 pub mod gotek;
-pub mod inkstitch;
-pub mod cli;
 pub mod gui;
+pub mod inkstitch;
 pub mod model;
 pub mod preview;
 pub mod shv;

@@ -6,3 +6,4 @@ AGENTS.md
 *.json
 !Cargo.toml
 !README.md
+/.workspace-agent-mcp/

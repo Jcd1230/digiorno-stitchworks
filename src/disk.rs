@@ -17,8 +17,8 @@ const PHV_BITMAP_WIDTH: usize = 173;
 const PHV_BITMAP_HEIGHT: usize = 181;
 const PHV_BITMAP_OFFSET: usize = 0x04fb;
 const PHV_HITBOX_BLOCK: [u8; 21] = [
-    0x01, 0x1a, 0x78, 0x1d, 0x17, 0x01, 0x1a, 0x52, 0x1d, 0x17, 0x00, 0x1a, 0x2c, 0x1d, 0x17,
-    0x00, 0x1a, 0x06, 0x1d, 0x17, 0x00,
+    0x01, 0x1a, 0x78, 0x1d, 0x17, 0x01, 0x1a, 0x52, 0x1d, 0x17, 0x00, 0x1a, 0x2c, 0x1d, 0x17, 0x00,
+    0x1a, 0x06, 0x1d, 0x17, 0x00,
 ];
 const MHV_BITMAP_WIDTH: usize = 244;
 const MHV_BITMAP_HEIGHT: usize = 238;
@@ -183,7 +183,7 @@ pub fn export_single_menu_disk(
             &extra_menu_file,
             build_mhv_for_label(options, &[], &menu_label_for_index(options, menu_idx + 1))?,
         )
-            .with_context(|| format!("writing {}", extra_menu_file.display()))?;
+        .with_context(|| format!("writing {}", extra_menu_file.display()))?;
         written_files.push(extra_menu_file);
     }
 
@@ -533,7 +533,16 @@ fn draw_menu_design_thumbnail(
             StitchCommand::Stitch => {
                 let pt = to_pixel(point.x, point.y);
                 if let Some(prev_pt) = prev {
-                    draw_indexed_line(dest, width, height, prev_pt.0, prev_pt.1, pt.0, pt.1, current_value);
+                    draw_indexed_line(
+                        dest,
+                        width,
+                        height,
+                        prev_pt.0,
+                        prev_pt.1,
+                        pt.0,
+                        pt.1,
+                        current_value,
+                    );
                 } else {
                     set_indexed_pixel(dest, width, height, pt.0, pt.1, current_value);
                 }
@@ -577,17 +586,12 @@ fn draw_color_debug_tile(
         let x1 = (x0 + box_w).min(cell_x + cell_w - 1);
         let y1 = (y0 + box_h).min(cell_y + cell_h - 15);
         fill_rect(pixels, width, height, x0, y0, x1, y1, idx as u8);
-        stroke_rect(
-            pixels,
-            width,
-            height,
-            x0,
-            y0,
-            x1,
-            y1,
-            MHV_GRID_LINE_VALUE,
-        );
-        let text_value = if idx == MHV_TEXT_VALUE as usize { 0x0f } else { MHV_TEXT_VALUE };
+        stroke_rect(pixels, width, height, x0, y0, x1, y1, MHV_GRID_LINE_VALUE);
+        let text_value = if idx == MHV_TEXT_VALUE as usize {
+            0x0f
+        } else {
+            MHV_TEXT_VALUE
+        };
         draw_text(
             pixels,
             width,

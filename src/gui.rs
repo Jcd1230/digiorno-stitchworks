@@ -145,205 +145,7 @@ impl eframe::App for Designer1App {
             .resizable(true)
             .default_size(320.0)
             .show_inside(ui, |ui| {
-                ui.heading("Options");
-                ui.add_space(8.0);
-
-                ui.label("Input");
-                let input_text = self
-                    .input_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .or_else(|| {
-                        self.disk_root
-                            .as_ref()
-                            .map(|p| format!("Disk root: {}", p.display()))
-                    })
-                    .unwrap_or_else(|| "No file loaded".to_owned());
-                ui.monospace(input_text);
-
-                ui.separator();
-                ui.label("Internal SHV name");
-                ui.text_edit_singleline(&mut self.name_override);
-
-                ui.horizontal(|ui| {
-                    ui.label("Scale");
-                    ui.add(
-                        egui::DragValue::new(&mut self.scale)
-                            .speed(0.05)
-                            .range(0.01..=100.0),
-                    );
-                });
-                ui.checkbox(&mut self.center, "Center design at SHV origin");
-
-                egui::ComboBox::from_label("Input Y axis")
-                    .selected_text(self.input_y_axis.to_string())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.input_y_axis,
-                            InputYAxis::Down,
-                            "down / Ink-Stitch SVG",
-                        );
-                        ui.selectable_value(
-                            &mut self.input_y_axis,
-                            InputYAxis::Up,
-                            "up / Cartesian",
-                        );
-                    });
-
-                egui::ComboBox::from_label("SHV signature")
-                    .selected_text(self.signature.to_string())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.signature,
-                            SignatureMode::Official,
-                            "official Viking notice",
-                        );
-                        ui.selectable_value(
-                            &mut self.signature,
-                            SignatureMode::Zero,
-                            "zero-filled Embird-style",
-                        );
-                    });
-
-                if ui.button("Rebuild preview + SHV bytes").clicked() {
-                    self.rebuild_current();
-                }
-
-                ui.checkbox(&mut self.show_color_debug, "Show color debug swatch in MHV slot 6");
-
-                if let Some(design) = &self.design {
-                    ui.separator();
-                    ui.heading("Design stats");
-                    let stats = design.stats();
-                    egui::Grid::new("stats_grid")
-                        .num_columns(2)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("Name");
-                            ui.monospace(&design.name);
-                            ui.end_row();
-                            ui.label("Threads");
-                            ui.label(stats.thread_count.to_string());
-                            ui.end_row();
-                            ui.label("Points");
-                            ui.label(stats.point_count.to_string());
-                            ui.end_row();
-                            ui.label("Stitches");
-                            ui.label(stats.stitches.to_string());
-                            ui.end_row();
-                            ui.label("Jumps");
-                            ui.label(stats.jumps.to_string());
-                            ui.end_row();
-                            ui.label("Bounds");
-                            ui.monospace(format!(
-                                "L{} R{} B{} T{} mm",
-                                mm(stats.left),
-                                mm(stats.right),
-                                mm(stats.bottom),
-                                mm(stats.top)
-                            ));
-                            ui.end_row();
-                            ui.label("Size");
-                            ui.monospace(format!("{} × {} mm", mm(stats.width), mm(stats.height)));
-                            ui.end_row();
-                        });
-                }
-
-                if !self.disk_designs.is_empty() {
-                    ui.separator();
-                    ui.heading("Disk designs");
-                    if ui.button("MHV Preview").clicked() {
-                        self.show_mhv_preview = true;
-                    }
-                    let mut selected = None;
-                    for (idx, item) in self.disk_designs.iter().enumerate() {
-                        let is_selected = self.selected_disk_index == Some(idx);
-                        let label = format!("DES01_{:02} {}", item.slot, item.label);
-                        if ui.selectable_label(is_selected, label).clicked() {
-                            selected = Some(idx);
-                        }
-                    }
-                    if let Some(idx) = selected {
-                        self.select_disk_design(idx);
-                    }
-                }
-
-                if self.disk_root.is_some() {
-                    ui.separator();
-                    ui.heading("Gotek");
-                    ui.horizontal(|ui| {
-                        ui.label("Device");
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_gotek_devices();
-                        }
-                    });
-                    if self.gotek_devices.is_empty() {
-                        ui.label("No initialized Gotek devices detected.");
-                    } else {
-                        let selected = self
-                            .gotek_devices
-                            .iter()
-                            .find(|candidate| {
-                                candidate.path == PathBuf::from(self.gotek_device_path.trim())
-                            })
-                            .map(|candidate| candidate.label.clone())
-                            .unwrap_or_else(|| "Select device…".to_owned());
-                        egui::ComboBox::from_id_salt("gotek_device")
-                            .selected_text(selected)
-                            .show_ui(ui, |ui| {
-                                for candidate in self.gotek_devices.clone() {
-                                    if ui
-                                        .selectable_label(
-                                            candidate.path
-                                                == PathBuf::from(self.gotek_device_path.trim()),
-                                            &candidate.label,
-                                        )
-                                        .clicked()
-                                    {
-                                        self.gotek_device_path =
-                                            candidate.path.display().to_string();
-                                    }
-                                }
-                            });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.gotek_device_path);
-                        if ui.button("Browse…").clicked() {
-                            self.pick_gotek_device_file();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Slot");
-                        ui.add(egui::DragValue::new(&mut self.gotek_slot).range(0..=999));
-                    });
-                    if ui.button("Export To Gotek Slot").clicked() {
-                        self.export_to_gotek_slot();
-                    }
-                }
-
-                ui.separator();
-                ui.heading("Embedded SHV thumbnail preview");
-                if let (Some(preview), Some(report)) = (&self.preview_bytes, &self.report) {
-                    ui.label(format!(
-                        "{} x {} px",
-                        report.preview_width, report.preview_height
-                    ));
-                    draw_shv_preview(
-                        ui,
-                        preview,
-                        report.preview_width as usize,
-                        report.preview_height as usize,
-                    );
-                } else {
-                    ui.label("No preview built.");
-                }
-
-                ui.separator();
-                ui.heading("Status");
-                ui.label(&self.status);
-                if let Some(error) = &self.error {
-                    ui.colored_label(Color32::from_rgb(190, 40, 40), error);
-                }
+                self.show_sidebar(ui);
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -517,7 +319,8 @@ impl Designer1App {
         };
         let shv = build_shv(&design, &options)?;
         let report = validate_generated_shv(&shv)?;
-        let preview = shv[report.preview_offset..report.preview_offset + report.preview_length].to_vec();
+        let preview =
+            shv[report.preview_offset..report.preview_offset + report.preview_length].to_vec();
 
         self.design = Some(design);
         self.shv_bytes = Some(shv);
@@ -657,6 +460,258 @@ impl Designer1App {
             ));
             self.status = "Gotek export failed.".to_owned();
         }
+    }
+
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Options");
+        ui.add_space(8.0);
+        self.show_input_section(ui);
+        ui.separator();
+        self.show_conversion_section(ui);
+
+        if self.design.is_some() {
+            ui.separator();
+            self.show_design_stats_section(ui);
+        }
+        if !self.disk_designs.is_empty() {
+            ui.separator();
+            self.show_disk_designs_section(ui);
+        }
+        if self.disk_root.is_some() {
+            ui.separator();
+            self.show_gotek_section(ui);
+        }
+
+        ui.separator();
+        self.show_thumbnail_section(ui);
+        ui.separator();
+        self.show_status_section(ui);
+    }
+
+    fn show_input_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Input")
+            .default_open(true)
+            .show(ui, |ui| {
+                let input_text = self
+                    .input_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .or_else(|| {
+                        self.disk_root
+                            .as_ref()
+                            .map(|p| format!("Disk root: {}", p.display()))
+                    })
+                    .unwrap_or_else(|| "No file loaded".to_owned());
+                ui.monospace(input_text);
+            });
+    }
+
+    fn show_conversion_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Conversion")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Internal SHV name");
+                ui.text_edit_singleline(&mut self.name_override);
+
+                ui.horizontal(|ui| {
+                    ui.label("Scale");
+                    ui.add(
+                        egui::DragValue::new(&mut self.scale)
+                            .speed(0.05)
+                            .range(0.01..=100.0),
+                    );
+                });
+                ui.checkbox(&mut self.center, "Center design at SHV origin");
+
+                egui::ComboBox::from_label("Input Y axis")
+                    .selected_text(self.input_y_axis.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.input_y_axis,
+                            InputYAxis::Down,
+                            "down / Ink-Stitch SVG",
+                        );
+                        ui.selectable_value(
+                            &mut self.input_y_axis,
+                            InputYAxis::Up,
+                            "up / Cartesian",
+                        );
+                    });
+
+                egui::ComboBox::from_label("SHV signature")
+                    .selected_text(self.signature.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.signature,
+                            SignatureMode::Official,
+                            "official Viking notice",
+                        );
+                        ui.selectable_value(
+                            &mut self.signature,
+                            SignatureMode::Zero,
+                            "zero-filled Embird-style",
+                        );
+                    });
+
+                if ui.button("Rebuild preview + SHV bytes").clicked() {
+                    self.rebuild_current();
+                }
+
+                ui.checkbox(
+                    &mut self.show_color_debug,
+                    "Show color debug swatch in MHV slot 6",
+                );
+            });
+    }
+
+    fn show_design_stats_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Design stats")
+            .default_open(true)
+            .show(ui, |ui| {
+                let Some(design) = &self.design else {
+                    return;
+                };
+                let stats = design.stats();
+                egui::Grid::new("stats_grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.monospace(&design.name);
+                        ui.end_row();
+                        ui.label("Threads");
+                        ui.label(stats.thread_count.to_string());
+                        ui.end_row();
+                        ui.label("Points");
+                        ui.label(stats.point_count.to_string());
+                        ui.end_row();
+                        ui.label("Stitches");
+                        ui.label(stats.stitches.to_string());
+                        ui.end_row();
+                        ui.label("Jumps");
+                        ui.label(stats.jumps.to_string());
+                        ui.end_row();
+                        ui.label("Bounds");
+                        ui.monospace(format!(
+                            "L{} R{} B{} T{} mm",
+                            mm(stats.left),
+                            mm(stats.right),
+                            mm(stats.bottom),
+                            mm(stats.top)
+                        ));
+                        ui.end_row();
+                        ui.label("Size");
+                        ui.monospace(format!("{} × {} mm", mm(stats.width), mm(stats.height)));
+                        ui.end_row();
+                    });
+            });
+    }
+
+    fn show_disk_designs_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Disk designs")
+            .default_open(true)
+            .show(ui, |ui| {
+                if ui.button("MHV Preview").clicked() {
+                    self.show_mhv_preview = true;
+                }
+                let mut selected = None;
+                for (idx, item) in self.disk_designs.iter().enumerate() {
+                    let is_selected = self.selected_disk_index == Some(idx);
+                    let label = format!("DES01_{:02} {}", item.slot, item.label);
+                    if ui.selectable_label(is_selected, label).clicked() {
+                        selected = Some(idx);
+                    }
+                }
+                if let Some(idx) = selected {
+                    self.select_disk_design(idx);
+                }
+            });
+    }
+
+    fn show_gotek_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Gotek")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Device");
+                    if ui.button("Refresh").clicked() {
+                        self.refresh_gotek_devices();
+                    }
+                });
+                if self.gotek_devices.is_empty() {
+                    ui.label("No initialized Gotek devices detected.");
+                } else {
+                    let selected = self
+                        .gotek_devices
+                        .iter()
+                        .find(|candidate| {
+                            candidate.path == PathBuf::from(self.gotek_device_path.trim())
+                        })
+                        .map(|candidate| candidate.label.clone())
+                        .unwrap_or_else(|| "Select device…".to_owned());
+                    egui::ComboBox::from_id_salt("gotek_device")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for candidate in self.gotek_devices.clone() {
+                                if ui
+                                    .selectable_label(
+                                        candidate.path
+                                            == PathBuf::from(self.gotek_device_path.trim()),
+                                        &candidate.label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.gotek_device_path = candidate.path.display().to_string();
+                                }
+                            }
+                        });
+                }
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.gotek_device_path);
+                    if ui.button("Browse…").clicked() {
+                        self.pick_gotek_device_file();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Slot");
+                    ui.add(egui::DragValue::new(&mut self.gotek_slot).range(0..=999));
+                });
+                if ui.button("Export To Gotek Slot").clicked() {
+                    self.export_to_gotek_slot();
+                }
+            });
+    }
+
+    fn show_thumbnail_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Embedded SHV thumbnail preview")
+            .default_open(true)
+            .show(ui, |ui| {
+                if let (Some(preview), Some(report)) = (&self.preview_bytes, &self.report) {
+                    ui.label(format!(
+                        "{} x {} px",
+                        report.preview_width, report.preview_height
+                    ));
+                    draw_shv_preview(
+                        ui,
+                        preview,
+                        report.preview_width as usize,
+                        report.preview_height as usize,
+                    );
+                } else {
+                    ui.label("No preview built.");
+                }
+            });
+    }
+
+    fn show_status_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Status")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(&self.status);
+                if let Some(error) = &self.error {
+                    ui.colored_label(Color32::from_rgb(190, 40, 40), error);
+                }
+            });
     }
 
     fn show_mhv_preview_window(&mut self, ctx: &egui::Context) {
@@ -849,7 +904,13 @@ fn draw_design_path(
                         if ui.selectable_label(*show_cm_grid, "Show Grid").clicked() {
                             *show_cm_grid = !*show_cm_grid;
                         }
-                        if ui.button("Reset View").clicked() {
+                        if ui.button("−").clicked() {
+                            *zoom = (*zoom / 1.25).clamp(0.1, 20.0);
+                        }
+                        if ui.button("+").clicked() {
+                            *zoom = (*zoom * 1.25).clamp(0.1, 20.0);
+                        }
+                        if ui.button("Fit").clicked() {
                             *zoom = 1.0;
                             *pan = Vec2::ZERO;
                         }

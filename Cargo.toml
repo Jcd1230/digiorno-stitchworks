@@ -1,6 +1,6 @@
 [package]
 name = "designer1-tools"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust tools for Husqvarna/Viking Designer 1 embroidery files, disks, and Gotek media"

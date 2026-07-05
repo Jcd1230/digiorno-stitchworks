@@ -1,10 +1,11 @@
 use crate::model::{Design, SignatureMode, StitchCommand, Thread};
 use crate::preview::render_preview_4bpp_auto;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-pub const OFFICIAL_NOTICE: &[u8; 86] = b"Embroidery disk created using software licensed from Viking Sewing Machines AB, Sweden";
+pub const OFFICIAL_NOTICE: &[u8; 86] =
+    b"Embroidery disk created using software licensed from Viking Sewing Machines AB, Sweden";
 pub const ZERO_NOTICE: &[u8; 86] = &[0u8; 86];
 pub const SUMMARY_CONSTANTS: [u8; 6] = [0xc4, 0x28, 0x00, 0x30, 0x00, 0x00];
 pub const DEFAULT_BLACK_COLOR_INDEX: u8 = 7;
@@ -98,7 +99,10 @@ pub fn build_shv(design: &Design, options: &ShvOptions) -> Result<Vec<u8>> {
         bail!("too many color segments: {}", segments.len());
     }
 
-    let stitch_stream: Vec<u8> = segments.iter().flat_map(|s| s.records.iter().copied()).collect();
+    let stitch_stream: Vec<u8> = segments
+        .iter()
+        .flat_map(|s| s.records.iter().copied())
+        .collect();
     let total_records = stitch_stream.len() / 2;
     if total_records != segments.iter().map(|s| s.record_count()).sum::<usize>() {
         bail!("internal SHV record count mismatch");
@@ -205,9 +209,14 @@ fn build_segments(design: &Design) -> Result<(Vec<Segment>, Vec<(i32, i32)>)> {
 }
 
 fn new_segment(design: &Design, thread_index: usize, x_raw: i32, y_raw: i32) -> Segment {
-    let thread = design.threads.get(thread_index).or_else(|| design.threads.first());
+    let thread = design
+        .threads
+        .get(thread_index)
+        .or_else(|| design.threads.first());
     Segment {
-        color_index: thread.map(thread_to_color_index).unwrap_or(DEFAULT_BLACK_COLOR_INDEX),
+        color_index: thread
+            .map(thread_to_color_index)
+            .unwrap_or(DEFAULT_BLACK_COLOR_INDEX),
         start_x_raw: x_raw,
         start_y_raw: y_raw,
         records: Vec::new(),
@@ -241,9 +250,19 @@ fn safe_ascii_name(name: &str, max_len: usize) -> Result<Vec<u8>> {
     let cleaned: String = name
         .trim()
         .chars()
-        .map(|ch| if ch.is_ascii_graphic() || ch == ' ' { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_graphic() || ch == ' ' {
+                ch
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let cleaned = if cleaned.is_empty() { "design".to_owned() } else { cleaned };
+    let cleaned = if cleaned.is_empty() {
+        "design".to_owned()
+    } else {
+        cleaned
+    };
     let mut bytes = cleaned.into_bytes();
     bytes.truncate(max_len.min(255));
     if bytes.is_empty() {
@@ -517,7 +536,11 @@ fn read_u32(blob: &[u8], off: usize) -> Result<u32> {
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn stitch_points_from_shv(blob: &[u8]) -> Result<Vec<(i32, i32, bool)>> {

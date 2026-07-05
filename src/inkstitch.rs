@@ -1,5 +1,5 @@
 use crate::model::{Design, InputYAxis, StitchCommand, StitchPoint, Thread};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::de::{Error as DeError, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -111,7 +111,11 @@ pub fn load_inkstitch_json_file(path: impl AsRef<Path>, options: &LoadOptions) -
     normalize_inkstitch(parsed, fallback_name, options)
 }
 
-fn normalize_inkstitch(parsed: InkStitchFile, fallback_name: String, options: &LoadOptions) -> Result<Design> {
+fn normalize_inkstitch(
+    parsed: InkStitchFile,
+    fallback_name: String,
+    options: &LoadOptions,
+) -> Result<Design> {
     if parsed.stitches.is_empty() {
         bail!("JSON contains no stitches");
     }
@@ -122,9 +126,15 @@ fn normalize_inkstitch(parsed: InkStitchFile, fallback_name: String, options: &L
     let coords: Vec<(f64, f64)> = parsed.stitches.iter().map(|s| (s.x, s.y)).collect();
     let (cx, cy) = if options.center {
         let min_x = coords.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
-        let max_x = coords.iter().map(|(x, _)| *x).fold(f64::NEG_INFINITY, f64::max);
+        let max_x = coords
+            .iter()
+            .map(|(x, _)| *x)
+            .fold(f64::NEG_INFINITY, f64::max);
         let min_y = coords.iter().map(|(_, y)| *y).fold(f64::INFINITY, f64::min);
-        let max_y = coords.iter().map(|(_, y)| *y).fold(f64::NEG_INFINITY, f64::max);
+        let max_y = coords
+            .iter()
+            .map(|(_, y)| *y)
+            .fold(f64::NEG_INFINITY, f64::max);
         ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
     } else {
         (0.0, 0.0)
