@@ -285,7 +285,8 @@ pub fn verify_workspace_slots(
 
 pub fn write_slot(device: &Path, slot: u16, image: &Path) -> Result<SlotIoReport> {
     validate_slot(slot)?;
-    check_gotek_device_for_slot(device, slot)?;
+    let device = normalize_device_path(device);
+    check_gotek_device_for_slot(&device, slot)?;
     let data = fs::read(image).with_context(|| format!("reading {}", image.display()))?;
     if data.len() != FLOPPY_SIZE {
         bail!(
@@ -298,7 +299,7 @@ pub fn write_slot(device: &Path, slot: u16, image: &Path) -> Result<SlotIoReport
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(device)
+        .open(&device)
         .with_context(|| format!("opening {}", device.display()))?;
     let offset = slot_offset(slot);
     file.seek(SeekFrom::Start(offset))?;
@@ -372,7 +373,8 @@ pub fn inspect_image(path: &Path) -> Result<ImageInspection> {
 }
 
 pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
-    let mut file = File::open(device).with_context(|| format!("opening {}", device.display()))?;
+    let device = normalize_device_path(device);
+    let mut file = File::open(&device).with_context(|| format!("opening {}", device.display()))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("stat {}", device.display()))?;
@@ -396,7 +398,7 @@ pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
         );
     }
     Ok(GotekDeviceCheck {
-        device: device.to_path_buf(),
+        device,
         size_bytes,
         slot_count: size_bytes.map(|size| size / FLOPPY_SIZE as u64),
         is_regular_file,
@@ -458,10 +460,110 @@ fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
     candidates
 }
+#[cfg(target_os = "windows")]
+fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
+    let mut candidates = Vec::new();
+    let drives = unsafe { windows::GetLogicalDrives() };
+    if drives == 0 {
+        return candidates;
+    }
 
-#[cfg(not(target_os = "linux"))]
+    for idx in 0..26 {
+        if drives & (1 << idx) == 0 {
+            continue;
+        }
+        let letter = (b'A' + idx as u8) as char;
+        let root = format!("{letter}:\\");
+        let root_wide = windows_wide_null(&root);
+        let drive_type = unsafe { windows::GetDriveTypeW(root_wide.as_ptr()) };
+
+        // Be deliberately conservative: only auto-select removable drives. Users can still
+        // paste an explicit \\.\PhysicalDriveN path into the GUI/CLI for advanced recovery or
+        // initialization cases after independently verifying the disk number.
+        if drive_type != windows::DRIVE_REMOVABLE {
+            continue;
+        }
+
+        let path = windows_raw_volume_path(letter);
+        let Ok(check) = check_gotek_device(&path) else {
+            continue;
+        };
+        let size = check
+            .slot_count
+            .map(|slots| format!("{slots} slot(s)"))
+            .unwrap_or_else(|| "raw removable volume".to_owned());
+        let label = format!(
+            "{} - removable Windows volume {} ({size})",
+            path.display(),
+            root
+        );
+        candidates.push(GotekDeviceCandidate { path, label, check });
+    }
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    candidates
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
     Vec::new()
+}
+
+fn normalize_device_path(device: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        normalize_windows_device_path(device)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        device.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_device_path(device: &Path) -> PathBuf {
+    let text = device.as_os_str().to_string_lossy();
+    if let Some(letter) = windows_drive_letter_path(&text) {
+        return windows_raw_volume_path(letter);
+    }
+    device.to_path_buf()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_drive_letter_path(text: &str) -> Option<char> {
+    let text = text.trim();
+    let raw_prefix = "\\\\.\\";
+    let rest = text.strip_prefix(raw_prefix).unwrap_or(text);
+    let mut chars = rest.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    match chars.next() {
+        None => Some(letter.to_ascii_uppercase()),
+        Some('\\' | '/') if chars.next().is_none() => Some(letter.to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_raw_volume_path(letter: char) -> PathBuf {
+    PathBuf::from(format!("\\\\.\\{}:", letter.to_ascii_uppercase()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    pub const DRIVE_REMOVABLE: u32 = 2;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        pub fn GetLogicalDrives() -> u32;
+        pub fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    }
 }
 
 fn pack_slot_dir(
@@ -998,13 +1100,13 @@ fn validate_slot(slot: u16) -> Result<()> {
 
 fn read_slot_bytes(device: &Path, slot: u16) -> Result<Vec<u8>> {
     validate_slot(slot)?;
-    let mut file = File::open(device).with_context(|| format!("opening {}", device.display()))?;
+    let device = normalize_device_path(device);
+    let mut file = File::open(&device).with_context(|| format!("opening {}", device.display()))?;
     file.seek(SeekFrom::Start(slot_offset(slot)))?;
     let mut data = vec![0u8; FLOPPY_SIZE];
     file.read_exact(&mut data)?;
     Ok(data)
 }
-
 fn sha256_file(path: &Path) -> Result<String> {
     let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(sha256_bytes(&data))
