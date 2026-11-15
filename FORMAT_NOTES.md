@@ -30,8 +30,9 @@ MENU_04/
 Notes:
 
 - The machine expects all four `MENU_0X` directories to exist.
-- `MENU_01` contains up to 6 design files in current tooling.
-- `MENU_02` through `MENU_04` may be placeholder menus, but the directories and `.MHV` files still need to exist.
+- The machine supports up to 36 designs per menu across its supported grid/page layouts.
+- Current tooling intentionally uses the 3x2 large-icon layout and therefore writes up to 6 designs per menu.
+- Any of `MENU_01` through `MENU_04` may be populated; unused menus still need their directory and `.MHV` file.
 
 ## PHV: `MENU_SEL.PHV`
 

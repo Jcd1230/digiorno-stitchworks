@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_MENU_DESIGNS: usize = 6;
+pub const MAX_MENU_DESIGNS: usize = 6;
 const MENU_DIR: &str = "MENU_01";
 const MENU_FILE: &str = "MENU_01.MHV";
 const ROOT_MENU_FILE: &str = "MENU_SEL.PHV";
@@ -101,6 +101,12 @@ pub struct DiskExportReport {
     pub designs: Vec<DiskWrittenDesign>,
     pub written_files: Vec<PathBuf>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuiltMenuAsset {
+    pub relative_path: PathBuf,
+    pub bytes: Vec<u8>,
 }
 
 pub fn load_disk_designs(
@@ -198,6 +204,52 @@ pub fn export_single_menu_disk(
         written_files,
         warnings: Vec::new(),
     })
+}
+
+pub fn build_menu_assets(
+    menu_index: u8,
+    designs: &[DiskDesignInput],
+    options: &DiskExportOptions,
+    menu_label: &str,
+) -> Result<Vec<BuiltMenuAsset>> {
+    if !(1..=4).contains(&menu_index) {
+        bail!("menu index must be 1..=4, got {menu_index}");
+    }
+    if designs.len() > MAX_MENU_DESIGNS {
+        bail!(
+            "3x2 menu export supports at most {MAX_MENU_DESIGNS} designs; found {}",
+            designs.len()
+        );
+    }
+
+    let menu_dir = format!("MENU_{menu_index:02}");
+    let mut assets = Vec::with_capacity(designs.len() + 1);
+    for input in designs {
+        if input.slot == 0 || input.slot as usize > MAX_MENU_DESIGNS {
+            bail!(
+                "design slot must be 1..={MAX_MENU_DESIGNS}, got {}",
+                input.slot
+            );
+        }
+        let bytes = build_shv(
+            &input.design,
+            &ShvOptions {
+                name: Some(input.label.clone()),
+                signature: options.signature,
+            },
+        )?;
+        validate_generated_shv(&bytes)?;
+        assets.push(BuiltMenuAsset {
+            relative_path: PathBuf::from(&menu_dir)
+                .join(format!("DES{menu_index:02}_{:02}.SHV", input.slot)),
+            bytes,
+        });
+    }
+    assets.push(BuiltMenuAsset {
+        relative_path: PathBuf::from(&menu_dir).join(format!("MENU_{menu_index:02}.MHV")),
+        bytes: build_mhv_for_label(options, designs, menu_label)?,
+    });
+    Ok(assets)
 }
 
 fn discover_json_files(root_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -402,11 +454,12 @@ pub fn render_mhv_preview_pixels(
     let mut pixels = vec![0u8; MHV_LOGICAL_WIDTH * MHV_LOGICAL_HEIGHT];
     draw_mhv_grid(&mut pixels, MHV_LOGICAL_WIDTH, MHV_LOGICAL_HEIGHT);
 
-    for (idx, design) in designs
-        .iter()
-        .take(MAX_MENU_DESIGNS.saturating_sub(1))
-        .enumerate()
-    {
+    let visible_designs = if show_color_debug {
+        MAX_MENU_DESIGNS.saturating_sub(1)
+    } else {
+        MAX_MENU_DESIGNS
+    };
+    for (idx, design) in designs.iter().take(visible_designs).enumerate() {
         let col = idx % MHV_GRID_COLS;
         let row = idx / MHV_GRID_COLS;
         let cell_x = col * MHV_GRID_CELL_W;
@@ -874,6 +927,33 @@ mod tests {
         );
         assert_eq!(phv[PHV_BITMAP_OFFSET - 2], PHV_BITMAP_HEIGHT as u8);
         assert_eq!(phv[PHV_BITMAP_OFFSET - 1], PHV_BITMAP_WIDTH as u8);
+    }
+
+    #[test]
+    fn builds_assets_for_selected_menu() {
+        let options = DiskExportOptions::default();
+        let assets = build_menu_assets(
+            3,
+            &[sample_disk_design(1, "One"), sample_disk_design(2, "Two")],
+            &options,
+            "Animals",
+        )
+        .unwrap();
+        let paths = assets
+            .iter()
+            .map(|asset| asset.relative_path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "MENU_03/DES03_01.SHV",
+                "MENU_03/DES03_02.SHV",
+                "MENU_03/MENU_03.MHV",
+            ]
+        );
+        let mhv = &assets.last().unwrap().bytes;
+        assert_eq!(&mhv[0x56..0x5d], b"Animals");
+        assert_eq!(&mhv[0x0119..0x011d], &[0x01, 0x02, 0x00, 0x00]);
     }
 
     #[test]

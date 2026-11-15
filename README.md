@@ -15,6 +15,7 @@ This project focuses on practical interoperability with real Designer 1 hardware
 - Export a single-menu Designer 1 disk layout with `MENU_SEL.PHV`, `MENU_0X.MHV`, and `DES01_XX.SHV`.
 - Build and inspect 1.44MB FAT12 floppy images for Designer 1 media.
 - Manage Gotek workspaces, slot images, device writes, and verification.
+- Replace a complete Gotek slot or update only Menu 1–4 while preserving the other menus.
 - Preview designs and machine-style graphics in an `egui` desktop app.
 
 ## Project Status
@@ -164,7 +165,7 @@ or:
 cargo run --bin designer1-gui
 ```
 
-The GUI is intended as both a working frontend and an inspection surface. It can load designs, preview stitch geometry, show machine-style previews, export disk assets, and help verify what will actually be written to media.
+The GUI is intended as both a working frontend and an inspection surface. It can load designs, preview stitch geometry, show machine-style previews, export disk assets, and help verify what will actually be written to media. Gotek uploads can either replace the complete slot with the existing single-menu layout or replace one selected `MENU_0X` directory while preserving the other menus and root files.
 
 ## Validation
 
@@ -192,3 +193,21 @@ Licensed under either of:
 - Apache-2.0
 
 at your option.
+
+### Windows Gotek devices
+
+The GUI remembers its last opened folder in `%LOCALAPPDATA%\designer1-rs\gui.toml`.
+For raw Gotek media, run Designer 1 as administrator, then refresh the device list.
+Initialized USB disks appear with their physical disk number, drive letters, capacity,
+and slot count. A drive letter such as `D:\` and a path such as
+`\\.\PhysicalDrive2` can also be entered directly. Check the disk number and
+capacity before writing: slot writes replace data on the selected disk.
+
+The application resolves a drive letter to the whole disk because later Gotek slots
+lie beyond the mounted floppy volume. It supports single-extent volumes starting at
+the beginning of the disk. Close Explorer windows and other programs using the
+stick before writing; Designer 1 locks and dismounts its mounted volume while
+writing. If a lock fails, close the other programs and retry. Use Windows' safely
+remove hardware action before unplugging the device. Uninitialized media and
+partitioned or multi-disk volumes are not automatically selected. Regular bank
+image files do not require administrator access.

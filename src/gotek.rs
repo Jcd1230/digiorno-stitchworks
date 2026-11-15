@@ -1,12 +1,17 @@
+use crate::shv::read_shv_name;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "windows")]
+#[path = "gotek_windows.rs"]
+mod windows_device;
 
 pub const FLOPPY_SIZE: usize = 1_474_560;
 pub const SLOT_COUNT: u16 = 1000;
@@ -84,6 +89,41 @@ pub struct ImageInspection {
     pub valid_fat12_1440: bool,
     pub label: Option<String>,
     pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotMenuInspection {
+    pub index: u8,
+    pub label: Option<String>,
+    pub files: Vec<String>,
+    pub design_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotInspection {
+    pub device: PathBuf,
+    pub slot: u16,
+    pub valid_fat12_1440: bool,
+    pub designer1_disk: bool,
+    pub label: Option<String>,
+    pub files: Vec<String>,
+    pub design_names: Vec<String>,
+    pub menus: Vec<SlotMenuInspection>,
+}
+
+impl SlotInspection {
+    pub fn menu(&self, index: u8) -> Option<&SlotMenuInspection> {
+        self.menus.iter().find(|menu| menu.index == index)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MenuUpdateImageReport {
+    pub output: PathBuf,
+    pub menu_index: u8,
+    pub preserved_files: usize,
+    pub removed_files: Vec<String>,
+    pub written_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,6 +336,18 @@ pub fn write_slot(device: &Path, slot: u16, image: &Path) -> Result<SlotIoReport
             FLOPPY_SIZE
         );
     }
+    #[cfg(target_os = "windows")]
+    if windows_device::is_raw_device(&device) {
+        windows_device::write_slot(&device, slot_offset(slot), &data)?;
+        return Ok(SlotIoReport {
+            slot,
+            image: image.to_path_buf(),
+            offset: slot_offset(slot),
+            bytes: data.len(),
+            sha256: sha256_bytes(&data),
+            status: "wrote".to_owned(),
+        });
+    }
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -372,8 +424,142 @@ pub fn inspect_image(path: &Path) -> Result<ImageInspection> {
     })
 }
 
+pub fn inspect_slot(device: &Path, slot: u16) -> Result<SlotInspection> {
+    let data = read_slot_bytes(device, slot)?;
+    let valid_fat12_1440 = is_valid_fat12_1440(&data);
+    let (label, records) = if valid_fat12_1440 {
+        let (label, _) = read_root_entries(&data);
+        (label, read_all_file_records(&data))
+    } else {
+        (None, Vec::new())
+    };
+    let discovered_files = records
+        .iter()
+        .map(|record| record.path.clone())
+        .collect::<Vec<_>>();
+    let designer1_disk = valid_fat12_1440 && is_designer1_disk(&discovered_files);
+    let menus = if designer1_disk {
+        read_slot_menu_inspections(&data, &records)
+    } else {
+        Vec::new()
+    };
+    let design_names = menus
+        .iter()
+        .flat_map(|menu| menu.design_names.iter().cloned())
+        .collect::<Vec<_>>();
+    let files = if designer1_disk {
+        discovered_files
+    } else {
+        Vec::new()
+    };
+
+    Ok(SlotInspection {
+        device: device.to_path_buf(),
+        slot,
+        valid_fat12_1440,
+        designer1_disk,
+        label,
+        files,
+        design_names,
+        menus,
+    })
+}
+
+pub fn create_updated_designer_menu_image(
+    device: &Path,
+    slot: u16,
+    menu_index: u8,
+    replacement_files: &[(String, Vec<u8>)],
+    output: &Path,
+) -> Result<MenuUpdateImageReport> {
+    if !(1..=4).contains(&menu_index) {
+        bail!("menu index must be 1..=4, got {menu_index}");
+    }
+    let data = read_slot_bytes(device, slot)?;
+    if !is_valid_fat12_1440(&data) {
+        bail!("slot {slot} is not a valid 1.44 MB FAT12 disk; use Single menu mode to replace it");
+    }
+    let (label, _) = read_root_entries(&data);
+    let records = read_all_file_records(&data);
+    let paths = records
+        .iter()
+        .map(|record| record.path.clone())
+        .collect::<Vec<_>>();
+    if !is_designer1_disk(&paths) {
+        bail!("slot {slot} is not a complete Designer 1 disk; use Single menu mode to replace it");
+    }
+
+    let target_prefix = format!("MENU_{menu_index:02}/");
+    let target_prefix_upper = target_prefix.to_ascii_uppercase();
+    let mut files = BTreeMap::<String, Vec<u8>>::new();
+    let mut removed_files = Vec::new();
+    for record in &records {
+        let normalized = record.path.replace('\\', "/");
+        if normalized
+            .to_ascii_uppercase()
+            .starts_with(&target_prefix_upper)
+        {
+            removed_files.push(normalized);
+            continue;
+        }
+        let bytes = read_fat_file_bytes(&data, record)
+            .with_context(|| format!("reading existing file {} from slot {slot}", record.path))?;
+        files.insert(normalized, bytes);
+    }
+
+    let mut written_files = Vec::new();
+    for (path, bytes) in replacement_files {
+        let normalized = path.replace('\\', "/");
+        path_to_image_path(Path::new(&normalized))?;
+        if !normalized
+            .to_ascii_uppercase()
+            .starts_with(&target_prefix_upper)
+        {
+            bail!(
+                "replacement file {normalized:?} is outside target directory MENU_{menu_index:02}"
+            );
+        }
+        if files
+            .keys()
+            .any(|existing| existing.eq_ignore_ascii_case(&normalized))
+        {
+            bail!("duplicate replacement path {normalized:?}");
+        }
+        written_files.push(normalized.clone());
+        files.insert(normalized, bytes.clone());
+    }
+    let expected_mhv = format!("MENU_{menu_index:02}/MENU_{menu_index:02}.MHV");
+    if !written_files
+        .iter()
+        .any(|path| path.eq_ignore_ascii_case(&expected_mhv))
+    {
+        bail!("target menu update is missing {expected_mhv}");
+    }
+
+    removed_files.sort_by_key(|path| path.to_ascii_uppercase());
+    written_files.sort_by_key(|path| path.to_ascii_uppercase());
+    let preserved_files = files.len().saturating_sub(written_files.len());
+    let image = build_fat12_image_from_memory(&files, label.as_deref())?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(output, image).with_context(|| format!("writing {}", output.display()))?;
+
+    Ok(MenuUpdateImageReport {
+        output: output.to_path_buf(),
+        menu_index,
+        preserved_files,
+        removed_files,
+        written_files,
+    })
+}
+
 pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
     let device = normalize_device_path(device);
+    #[cfg(target_os = "windows")]
+    if windows_device::is_raw_device(&device) {
+        return windows_device::check_device(&device);
+    }
     let mut file = File::open(&device).with_context(|| format!("opening {}", device.display()))?;
     let metadata = file
         .metadata()
@@ -400,7 +586,7 @@ pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
     Ok(GotekDeviceCheck {
         device,
         size_bytes,
-        slot_count: size_bytes.map(|size| size / FLOPPY_SIZE as u64),
+        slot_count: size_bytes.map(gotek_slot_count_for_size),
         is_regular_file,
         slot0_valid_fat12_1440,
     })
@@ -408,8 +594,8 @@ pub fn check_gotek_device(device: &Path) -> Result<GotekDeviceCheck> {
 
 fn check_gotek_device_for_slot(device: &Path, slot: u16) -> Result<GotekDeviceCheck> {
     let check = check_gotek_device(device)?;
-    let required = (slot as u64 + 1) * FLOPPY_SIZE as u64;
-    if check.is_regular_file && check.size_bytes.unwrap_or(0) < required {
+    let required = slot_offset(slot) + FLOPPY_SIZE as u64;
+    if check.size_bytes.is_some_and(|size| size < required) {
         bail!(
             "{} is {} bytes, but slot {slot} requires at least {required} bytes",
             device.display(),
@@ -420,7 +606,22 @@ fn check_gotek_device_for_slot(device: &Path, slot: u16) -> Result<GotekDeviceCh
 }
 
 pub fn list_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
-    platform_gotek_device_candidates()
+    try_list_gotek_device_candidates().unwrap_or_default()
+}
+
+pub fn try_list_gotek_device_candidates() -> Result<Vec<GotekDeviceCandidate>> {
+    Ok(discover_gotek_devices()?.0)
+}
+
+pub fn discover_gotek_devices() -> Result<(Vec<GotekDeviceCandidate>, Option<String>)> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_device::candidates()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok((platform_gotek_device_candidates(), None))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -460,47 +661,20 @@ fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
     candidates
 }
-#[cfg(target_os = "windows")]
-fn platform_gotek_device_candidates() -> Vec<GotekDeviceCandidate> {
-    let mut candidates = Vec::new();
-    let drives = unsafe { windows::GetLogicalDrives() };
-    if drives == 0 {
-        return candidates;
-    }
-
-    for idx in 0..26 {
-        if drives & (1 << idx) == 0 {
-            continue;
+pub fn gotek_device_paths_match(left: &Path, right: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        if windows_device::is_raw_device(left) && windows_device::is_raw_device(right) {
+            return match (
+                windows_device::resolve_disk_path(left),
+                windows_device::resolve_disk_path(right),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
         }
-        let letter = (b'A' + idx as u8) as char;
-        let root = format!("{letter}:\\");
-        let root_wide = windows_wide_null(&root);
-        let drive_type = unsafe { windows::GetDriveTypeW(root_wide.as_ptr()) };
-
-        // Be deliberately conservative: only auto-select removable drives. Users can still
-        // paste an explicit \\.\PhysicalDriveN path into the GUI/CLI for advanced recovery or
-        // initialization cases after independently verifying the disk number.
-        if drive_type != windows::DRIVE_REMOVABLE {
-            continue;
-        }
-
-        let path = windows_raw_volume_path(letter);
-        let Ok(check) = check_gotek_device(&path) else {
-            continue;
-        };
-        let size = check
-            .slot_count
-            .map(|slots| format!("{slots} slot(s)"))
-            .unwrap_or_else(|| "raw removable volume".to_owned());
-        let label = format!(
-            "{} - removable Windows volume {} ({size})",
-            path.display(),
-            root
-        );
-        candidates.push(GotekDeviceCandidate { path, label, check });
     }
-    candidates.sort_by(|a, b| a.path.cmp(&b.path));
-    candidates
+    left == right
 }
 
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
@@ -548,22 +722,6 @@ fn windows_drive_letter_path(text: &str) -> Option<char> {
 #[cfg(target_os = "windows")]
 fn windows_raw_volume_path(letter: char) -> PathBuf {
     PathBuf::from(format!("\\\\.\\{}:", letter.to_ascii_uppercase()))
-}
-
-#[cfg(target_os = "windows")]
-fn windows_wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(target_os = "windows")]
-mod windows {
-    pub const DRIVE_REMOVABLE: u32 = 2;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        pub fn GetLogicalDrives() -> u32;
-        pub fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
-    }
 }
 
 fn pack_slot_dir(
@@ -690,6 +848,44 @@ fn build_fat12_image(entries: &[ImageEntry], label: Option<&str>) -> Result<Vec<
                 .with_context(|| format!("reading {}", entry.source.display()))?;
             builder.add_file(&entry.image_path, &data, entry.timestamp)?;
         }
+    }
+    builder.finish()
+}
+
+fn build_fat12_image_from_memory(
+    files: &BTreeMap<String, Vec<u8>>,
+    label: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut image = vec![0u8; FLOPPY_SIZE];
+    write_boot_sector(&mut image, label);
+    let mut builder = FatBuilder::new(image);
+    let timestamp = FatTimestamp::now();
+    if let Some(label) = label.and_then(volume_label_11) {
+        builder.add_volume_label(&label, timestamp)?;
+    }
+
+    let mut directories = BTreeSet::new();
+    for path in files.keys() {
+        let mut parent = path.rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(dir) = parent {
+            directories.insert(dir.to_owned());
+            parent = dir.rsplit_once('/').map(|(parent, _)| parent);
+        }
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by(|a, b| {
+        a.matches('/')
+            .count()
+            .cmp(&b.matches('/').count())
+            .then_with(|| a.to_ascii_uppercase().cmp(&b.to_ascii_uppercase()))
+    });
+    for directory in directories {
+        path_to_image_path(Path::new(&directory))?;
+        builder.add_dir(&directory, timestamp)?;
+    }
+    for (path, data) in files {
+        path_to_image_path(Path::new(path))?;
+        builder.add_file(path, data, timestamp)?;
     }
     builder.finish()
 }
@@ -900,7 +1096,7 @@ fn read_root_entries(data: &[u8]) -> (Option<String>, Vec<String>) {
         }
         let attrs = entry[11];
         if attrs & 0x08 != 0 {
-            label = Some(decode_short_name(&entry[0..11]));
+            label = Some(decode_volume_label(&entry[0..11]));
         } else if attrs & 0x0f != 0x0f {
             files.push(decode_short_name(&entry[0..11]));
         }
@@ -908,6 +1104,206 @@ fn read_root_entries(data: &[u8]) -> (Option<String>, Vec<String>) {
     (label, files)
 }
 
+#[derive(Debug, Clone)]
+struct FatFileRecord {
+    path: String,
+    first_cluster: u16,
+    size: usize,
+}
+
+fn read_all_file_records(data: &[u8]) -> Vec<FatFileRecord> {
+    let mut files = Vec::new();
+    let mut visited_dirs = HashSet::new();
+    collect_directory_file_records(data, None, "", &mut visited_dirs, &mut files);
+    files.sort_by_key(|record| record.path.to_ascii_uppercase());
+    files
+}
+
+fn collect_directory_file_records(
+    data: &[u8],
+    first_cluster: Option<u16>,
+    parent: &str,
+    visited_dirs: &mut HashSet<u16>,
+    files: &mut Vec<FatFileRecord>,
+) {
+    for entry in read_directory_records(data, first_cluster) {
+        let attrs = entry[11];
+        if entry[0] == 0xe5 || attrs & 0x0f == 0x0f || attrs & 0x08 != 0 {
+            continue;
+        }
+        let name = decode_short_name(&entry[0..11]);
+        if name == "." || name == ".." || name.is_empty() {
+            continue;
+        }
+        let path = if parent.is_empty() {
+            name
+        } else {
+            format!("{parent}/{name}")
+        };
+        let cluster = u16::from_le_bytes([entry[26], entry[27]]);
+        if attrs & 0x10 != 0 {
+            if cluster >= 2 && visited_dirs.insert(cluster) {
+                collect_directory_file_records(data, Some(cluster), &path, visited_dirs, files);
+            }
+        } else {
+            files.push(FatFileRecord {
+                path,
+                first_cluster: cluster,
+                size: u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as usize,
+            });
+        }
+    }
+}
+
+fn read_slot_menu_inspections(data: &[u8], files: &[FatFileRecord]) -> Vec<SlotMenuInspection> {
+    (1..=4)
+        .map(|index| {
+            let prefix = format!("MENU_{index:02}/");
+            let prefix_upper = prefix.to_ascii_uppercase();
+            let mut menu_files = files
+                .iter()
+                .filter(|file| {
+                    file.path
+                        .replace('\\', "/")
+                        .to_ascii_uppercase()
+                        .starts_with(&prefix_upper)
+                })
+                .collect::<Vec<_>>();
+            menu_files.sort_by_key(|file| file.path.to_ascii_uppercase());
+            let mhv_name = format!("MENU_{index:02}/MENU_{index:02}.MHV");
+            let label = menu_files
+                .iter()
+                .find(|file| file.path.eq_ignore_ascii_case(&mhv_name))
+                .and_then(|file| read_fat_file_bytes(data, file))
+                .and_then(|bytes| read_mhv_label(&bytes));
+            let mut design_names = menu_files
+                .iter()
+                .filter(|file| file.path.to_ascii_uppercase().ends_with(".SHV"))
+                .filter_map(|file| {
+                    read_fat_file_bytes(data, file)
+                        .and_then(|bytes| read_shv_name(&bytes).ok())
+                        .or_else(|| {
+                            Path::new(&file.path)
+                                .file_stem()
+                                .and_then(OsStr::to_str)
+                                .map(str::to_owned)
+                        })
+                })
+                .collect::<Vec<_>>();
+            design_names.sort_by_key(|name| name.to_ascii_uppercase());
+            SlotMenuInspection {
+                index,
+                label,
+                files: menu_files.iter().map(|file| file.path.clone()).collect(),
+                design_names,
+            }
+        })
+        .collect()
+}
+
+fn read_mhv_label(bytes: &[u8]) -> Option<String> {
+    const LABELS_OFFSET: usize = 0x56;
+    const LABEL_WIDTH: usize = 12;
+    const LABEL_COUNT: usize = 16;
+    for index in 0..LABEL_COUNT {
+        let start = LABELS_OFFSET + index * LABEL_WIDTH;
+        let end = start + LABEL_WIDTH;
+        let raw = bytes.get(start..end)?;
+        let label = String::from_utf8_lossy(raw)
+            .trim_matches(['\0', ' '])
+            .to_owned();
+        if !label.is_empty() {
+            return Some(label);
+        }
+    }
+    None
+}
+
+fn read_fat_file_bytes(data: &[u8], file: &FatFileRecord) -> Option<Vec<u8>> {
+    if file.size == 0 {
+        return Some(Vec::new());
+    }
+    let mut cluster = file.first_cluster;
+    let mut visited = HashSet::new();
+    let mut out = Vec::with_capacity(file.size);
+    while (2..0x0ff8).contains(&cluster) && visited.insert(cluster) {
+        let offset = cluster_offset(cluster);
+        let cluster_data = data.get(offset..offset + BYTES_PER_SECTOR)?;
+        let remaining = file.size.saturating_sub(out.len());
+        out.extend_from_slice(&cluster_data[..remaining.min(cluster_data.len())]);
+        if out.len() == file.size {
+            return Some(out);
+        }
+        cluster = fat12_next_cluster(data, cluster)?;
+    }
+    None
+}
+
+fn read_directory_records(data: &[u8], first_cluster: Option<u16>) -> Vec<[u8; 32]> {
+    let mut records = Vec::new();
+    if let Some(mut cluster) = first_cluster {
+        let mut visited_clusters = HashSet::new();
+        while (2..0x0ff8).contains(&cluster) && visited_clusters.insert(cluster) {
+            let offset = cluster_offset(cluster);
+            let Some(cluster_data) = data.get(offset..offset + BYTES_PER_SECTOR) else {
+                break;
+            };
+            if append_directory_records(cluster_data, &mut records) {
+                break;
+            }
+            let Some(next) = fat12_next_cluster(data, cluster) else {
+                break;
+            };
+            cluster = next;
+        }
+    } else {
+        let root_start = FIRST_ROOT_SECTOR * BYTES_PER_SECTOR;
+        let root_end = root_start + ROOT_DIR_SECTORS * BYTES_PER_SECTOR;
+        if let Some(root) = data.get(root_start..root_end) {
+            append_directory_records(root, &mut records);
+        }
+    }
+    records
+}
+
+fn append_directory_records(bytes: &[u8], records: &mut Vec<[u8; 32]>) -> bool {
+    for entry in bytes.chunks_exact(32) {
+        if entry[0] == 0x00 {
+            return true;
+        }
+        let mut record = [0u8; 32];
+        record.copy_from_slice(entry);
+        records.push(record);
+    }
+    false
+}
+
+fn fat12_next_cluster(data: &[u8], cluster: u16) -> Option<u16> {
+    let offset = BYTES_PER_SECTOR + (cluster as usize * 3) / 2;
+    let low = *data.get(offset)? as u16;
+    let high = *data.get(offset + 1)? as u16;
+    let value = if cluster % 2 == 0 {
+        low | ((high & 0x000f) << 8)
+    } else {
+        (low >> 4) | (high << 4)
+    };
+    Some(value & 0x0fff)
+}
+
+fn is_designer1_disk(files: &[String]) -> bool {
+    const REQUIRED: [&str; 5] = [
+        "MENU_SEL.PHV",
+        "MENU_01/MENU_01.MHV",
+        "MENU_02/MENU_02.MHV",
+        "MENU_03/MENU_03.MHV",
+        "MENU_04/MENU_04.MHV",
+    ];
+    let normalized = files
+        .iter()
+        .map(|path| path.replace('\\', "/").to_ascii_uppercase())
+        .collect::<HashSet<_>>();
+    REQUIRED.iter().all(|path| normalized.contains(*path))
+}
 #[derive(Debug, Clone, Copy)]
 struct FatTimestamp {
     time: u16,
@@ -1075,6 +1471,10 @@ fn decode_short_name(raw: &[u8]) -> String {
     }
 }
 
+fn decode_volume_label(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).trim_end().to_owned()
+}
+
 fn cluster_offset(cluster: u16) -> usize {
     (FIRST_DATA_SECTOR + (cluster as usize - 2)) * BYTES_PER_SECTOR
 }
@@ -1091,6 +1491,14 @@ fn slot_offset(slot: u16) -> u64 {
     slot as u64 * SLOT_STRIDE as u64
 }
 
+pub fn gotek_slot_count_for_size(size: u64) -> u64 {
+    if size < FLOPPY_SIZE as u64 {
+        0
+    } else {
+        1 + (size - FLOPPY_SIZE as u64) / SLOT_STRIDE as u64
+    }
+}
+
 fn validate_slot(slot: u16) -> Result<()> {
     if slot >= SLOT_COUNT {
         bail!("slot must be 0..{}, got {slot}", SLOT_COUNT - 1);
@@ -1101,6 +1509,10 @@ fn validate_slot(slot: u16) -> Result<()> {
 fn read_slot_bytes(device: &Path, slot: u16) -> Result<Vec<u8>> {
     validate_slot(slot)?;
     let device = normalize_device_path(device);
+    #[cfg(target_os = "windows")]
+    if windows_device::is_raw_device(&device) {
+        return windows_device::read_slot(&device, slot_offset(slot));
+    }
     let mut file = File::open(&device).with_context(|| format!("opening {}", device.display()))?;
     file.seek(SeekFrom::Start(slot_offset(slot)))?;
     let mut data = vec![0u8; FLOPPY_SIZE];
@@ -1376,6 +1788,20 @@ mod tests {
     }
 
     #[test]
+    fn calculates_slot_count_using_gotek_stride() {
+        assert_eq!(gotek_slot_count_for_size((FLOPPY_SIZE - 1) as u64), 0);
+        assert_eq!(gotek_slot_count_for_size(FLOPPY_SIZE as u64), 1);
+        assert_eq!(
+            gotek_slot_count_for_size((SLOT_STRIDE + FLOPPY_SIZE) as u64),
+            2
+        );
+        assert_eq!(
+            gotek_slot_count_for_size((2 * SLOT_STRIDE + FLOPPY_SIZE) as u64),
+            3
+        );
+    }
+
+    #[test]
     fn packs_files_and_writes_reads_slot_bank() {
         let dir = temp_dir("gotek");
         fs::create_dir_all(dir.join("gotek/001/MENU_01")).unwrap();
@@ -1440,6 +1866,178 @@ mod tests {
     }
 
     #[test]
+    fn inspects_designer_slot_recursively_and_treats_other_disks_as_empty() {
+        let dir = temp_dir("inspect_designer_slot");
+        let disk = dir.join("disk");
+        for menu in 1..=4 {
+            let menu_dir = disk.join(format!("MENU_{menu:02}"));
+            fs::create_dir_all(&menu_dir).unwrap();
+            fs::write(
+                menu_dir.join(format!("MENU_{menu:02}.MHV")),
+                format!("menu {menu}"),
+            )
+            .unwrap();
+        }
+        fs::write(disk.join("MENU_SEL.PHV"), b"root").unwrap();
+        fs::write(
+            disk.join("MENU_01/DES01_01.SHV"),
+            test_shv_with_name("Flowers"),
+        )
+        .unwrap();
+        fs::write(
+            disk.join("MENU_01/OLD.SHV"),
+            test_shv_with_name("Old Design"),
+        )
+        .unwrap();
+
+        let image = dir.join("slot.img");
+        let written = vec![
+            disk.join("MENU_SEL.PHV"),
+            disk.join("MENU_01"),
+            disk.join("MENU_02"),
+            disk.join("MENU_03"),
+            disk.join("MENU_04"),
+        ];
+        create_designer_disk_image(&disk, &written, &image, Some("DESIGNER1")).unwrap();
+
+        let bank = dir.join("bank.bin");
+        let mut bank_bytes = vec![0u8; SLOT_STRIDE + FLOPPY_SIZE];
+        let blank = build_fat12_image(&[], Some("BLANK")).unwrap();
+        bank_bytes[..FLOPPY_SIZE].copy_from_slice(&blank);
+        bank_bytes[SLOT_STRIDE..SLOT_STRIDE + FLOPPY_SIZE]
+            .copy_from_slice(&fs::read(&image).unwrap());
+        fs::write(&bank, bank_bytes).unwrap();
+
+        let blank_slot = inspect_slot(&bank, 0).unwrap();
+        assert!(blank_slot.valid_fat12_1440);
+        assert!(!blank_slot.designer1_disk);
+        assert!(blank_slot.files.is_empty());
+        assert!(blank_slot.design_names.is_empty());
+
+        let designer_slot = inspect_slot(&bank, 1).unwrap();
+        assert!(designer_slot.valid_fat12_1440);
+        assert!(designer_slot.designer1_disk);
+        assert_eq!(designer_slot.label.as_deref(), Some("DESIGNER1"));
+        assert!(
+            designer_slot
+                .files
+                .contains(&"MENU_01/DES01_01.SHV".to_owned())
+        );
+        assert!(designer_slot.files.contains(&"MENU_01/OLD.SHV".to_owned()));
+        assert!(
+            designer_slot
+                .files
+                .contains(&"MENU_04/MENU_04.MHV".to_owned())
+        );
+        assert_eq!(
+            designer_slot.design_names,
+            vec!["Flowers".to_owned(), "Old Design".to_owned()]
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn targeted_menu_update_preserves_other_menu_files() {
+        let dir = temp_dir("targeted_menu_update");
+        let disk = dir.join("disk");
+        for menu in 1..=4 {
+            let menu_dir = disk.join(format!("MENU_{menu:02}"));
+            fs::create_dir_all(&menu_dir).unwrap();
+            fs::write(
+                menu_dir.join(format!("MENU_{menu:02}.MHV")),
+                format!("original menu {menu}"),
+            )
+            .unwrap();
+            fs::write(
+                menu_dir.join(format!("DES{menu:02}_01.SHV")),
+                test_shv_with_name(&format!("Original {menu}")),
+            )
+            .unwrap();
+        }
+        fs::write(disk.join("MENU_SEL.PHV"), b"root menu unchanged").unwrap();
+        fs::write(disk.join("README.TXT"), b"preserve me").unwrap();
+
+        let original_image = dir.join("original.img");
+        let written = vec![
+            disk.join("MENU_SEL.PHV"),
+            disk.join("README.TXT"),
+            disk.join("MENU_01"),
+            disk.join("MENU_02"),
+            disk.join("MENU_03"),
+            disk.join("MENU_04"),
+        ];
+        create_designer_disk_image(&disk, &written, &original_image, Some("DESIGNER1")).unwrap();
+
+        let bank = dir.join("bank.bin");
+        let mut bank_bytes = vec![0u8; SLOT_STRIDE + FLOPPY_SIZE];
+        let blank = build_fat12_image(&[], Some("BLANK")).unwrap();
+        bank_bytes[..FLOPPY_SIZE].copy_from_slice(&blank);
+        bank_bytes[SLOT_STRIDE..SLOT_STRIDE + FLOPPY_SIZE]
+            .copy_from_slice(&fs::read(&original_image).unwrap());
+        fs::write(&bank, bank_bytes).unwrap();
+
+        let updated_image = dir.join("updated.img");
+        let replacements = vec![
+            (
+                "MENU_02/MENU_02.MHV".to_owned(),
+                b"replacement menu 2".to_vec(),
+            ),
+            (
+                "MENU_02/DES02_01.SHV".to_owned(),
+                test_shv_with_name("Replacement 2"),
+            ),
+        ];
+        let report =
+            create_updated_designer_menu_image(&bank, 1, 2, &replacements, &updated_image).unwrap();
+        assert_eq!(report.menu_index, 2);
+        assert!(
+            report
+                .removed_files
+                .contains(&"MENU_02/MENU_02.MHV".to_owned())
+        );
+        assert!(
+            report
+                .removed_files
+                .contains(&"MENU_02/DES02_01.SHV".to_owned())
+        );
+
+        let original = fs::read(&original_image).unwrap();
+        let updated = fs::read(&updated_image).unwrap();
+        for path in [
+            "MENU_SEL.PHV",
+            "README.TXT",
+            "MENU_01/MENU_01.MHV",
+            "MENU_01/DES01_01.SHV",
+            "MENU_03/MENU_03.MHV",
+            "MENU_03/DES03_01.SHV",
+            "MENU_04/MENU_04.MHV",
+            "MENU_04/DES04_01.SHV",
+        ] {
+            assert_eq!(
+                file_bytes(&updated, path),
+                file_bytes(&original, path),
+                "preserved file changed: {path}"
+            );
+        }
+        assert_eq!(
+            file_bytes(&updated, "MENU_02/MENU_02.MHV"),
+            Some(b"replacement menu 2".to_vec())
+        );
+        assert_eq!(
+            file_bytes(&updated, "MENU_02/DES02_01.SHV"),
+            Some(test_shv_with_name("Replacement 2"))
+        );
+        assert!(is_designer1_disk(
+            &read_all_file_records(&updated)
+                .into_iter()
+                .map(|record| record.path)
+                .collect::<Vec<_>>()
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn subdirectories_include_dot_entries() {
         let dir = temp_dir("dot_entries");
         fs::create_dir_all(dir.join("disk/MENU_01")).unwrap();
@@ -1458,6 +2056,14 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    fn file_bytes(image: &[u8], path: &str) -> Option<Vec<u8>> {
+        let records = read_all_file_records(image);
+        let record = records
+            .iter()
+            .find(|record| record.path.eq_ignore_ascii_case(path))?;
+        read_fat_file_bytes(image, record)
+    }
+
     fn first_cluster_for_root_name(image: &[u8], name: &[u8; 11]) -> Option<u16> {
         let root_start = FIRST_ROOT_SECTOR * BYTES_PER_SECTOR;
         let root_end = root_start + ROOT_DIR_SECTORS * BYTES_PER_SECTOR;
@@ -1470,6 +2076,13 @@ mod tests {
             }
         }
         None
+    }
+
+    fn test_shv_with_name(name: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x57 + name.len()];
+        bytes[0x56] = name.len() as u8;
+        bytes[0x57..].copy_from_slice(name.as_bytes());
+        bytes
     }
 
     fn temp_dir(name: &str) -> PathBuf {

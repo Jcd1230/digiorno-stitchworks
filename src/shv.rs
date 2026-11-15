@@ -363,18 +363,31 @@ fn checked_i16(v: i32) -> Result<i16> {
     Ok(v as i16)
 }
 
-pub fn parse_generated_shv(blob: &[u8]) -> Result<ShvReadbackReport> {
+pub fn read_shv_name(blob: &[u8]) -> Result<String> {
     if blob.len() < 0x57 {
         bail!("SHV file too small");
     }
-
     let name_len = blob[0x56] as usize;
     let name_start = 0x57;
     let name_end = name_start + name_len;
-    if name_end + 6 > blob.len() {
-        bail!("SHV name or preview header is truncated");
+    if name_len == 0 || name_end > blob.len() {
+        bail!("SHV name is empty or truncated");
     }
-    let name = String::from_utf8_lossy(&blob[name_start..name_end]).to_string();
+    let name = String::from_utf8_lossy(&blob[name_start..name_end])
+        .trim_matches(['\0', ' '])
+        .to_owned();
+    if name.is_empty() {
+        bail!("SHV name is empty");
+    }
+    Ok(name)
+}
+
+pub fn parse_generated_shv(blob: &[u8]) -> Result<ShvReadbackReport> {
+    let name = read_shv_name(blob)?;
+    let name_end = 0x57 + blob[0x56] as usize;
+    if name_end + 6 > blob.len() {
+        bail!("SHV preview header is truncated");
+    }
     let preview_header_off = name_end;
     let preview_height = blob[preview_header_off];
     let preview_width = blob[preview_header_off + 1];
