@@ -1,5 +1,9 @@
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<_> = std::env::args_os().collect();
+    if designer1_tools::updater::handle_helper_args(&args) {
+        return Ok(());
+    }
+    designer1_tools::updater::cleanup_previous_update();
     let launch_gui = matches!(args.get(1).and_then(|arg| arg.to_str()), Some("--gui"));
 
     if launch_gui {

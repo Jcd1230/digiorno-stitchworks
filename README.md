@@ -167,6 +167,17 @@ cargo run --bin designer1-gui
 
 The GUI is intended as both a working frontend and an inspection surface. It can load designs, preview stitch geometry, show machine-style previews, export disk assets, and help verify what will actually be written to media. Gotek uploads can either replace the complete slot with the existing single-menu layout or replace one selected `MENU_0X` directory while preserving the other menus and root files.
 
+### App updates
+
+Official x86-64 Windows and Linux builds can check for updates under **App updates**
+in the GUI. Select **Check for Updates**, review the release notes, and select
+**Download and Install** to download the matching GitHub release, verify its
+SHA-256 digest, and restart into the new version. Update checks happen only when
+requested. The application directory must be writable; if it is not, download the
+release manually or run the app with suitable permissions. Package-managed and
+other platform builds should use their normal installation method. Existing
+versions without the updater must first be updated manually.
+
 ## Validation
 
 For format or media changes, a useful workflow is:

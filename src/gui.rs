@@ -11,6 +11,7 @@ use crate::inkstitch::{LoadOptions, load_inkstitch_json_file};
 use crate::model::{Design, InputYAxis, SignatureMode, StitchCommand};
 use crate::preview::DESIGNER1_PALETTE;
 use crate::shv::{ShvOptions, ShvReadbackReport, build_shv, validate_generated_shv};
+use crate::updater::{self, PreparedUpdate, UpdateInfo};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::BTreeMap;
@@ -23,6 +24,22 @@ const SETTINGS_DIR: &str = "designer1-rs";
 const SETTINGS_FILE: &str = "gui.toml";
 const GOTEK_INSPECTION_DEBOUNCE: Duration = Duration::from_millis(250);
 const GOTEK_INSPECTION_POLL: Duration = Duration::from_millis(40);
+
+enum UpdateMessage {
+    Checked(Result<Option<UpdateInfo>, String>),
+    Prepared(Result<PreparedUpdate, String>),
+}
+
+#[derive(Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading,
+    Error(String),
+}
 
 struct GotekInspectionMessage {
     generation: u64,
@@ -141,6 +158,9 @@ struct Designer1App {
 
     status: String,
     error: Option<String>,
+    update_state: UpdateState,
+    update_rx: Option<Receiver<UpdateMessage>>,
+    update_helper: Option<std::process::Child>,
 }
 
 impl Default for Designer1App {
@@ -184,6 +204,9 @@ impl Default for Designer1App {
             gotek_inspection_loading: false,
             status: "Load an Ink/Stitch JSON file to begin.".to_owned(),
             error: None,
+            update_state: UpdateState::Idle,
+            update_rx: None,
+            update_helper: None,
         }
     }
 }
@@ -192,6 +215,7 @@ impl eframe::App for Designer1App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.update_gotek_slot_inspection(&ctx);
+        self.poll_app_update(&ctx);
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Designer 1 SHV Converter");
@@ -916,6 +940,123 @@ impl Designer1App {
         self.show_thumbnail_section(ui);
         ui.separator();
         self.show_status_section(ui);
+        ui.separator();
+        self.show_update_section(ui);
+    }
+
+    fn show_update_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("App updates")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(format!("Installed version: {}", env!("CARGO_PKG_VERSION")));
+                let busy = matches!(
+                    self.update_state,
+                    UpdateState::Checking | UpdateState::Downloading
+                );
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Check for Updates"))
+                    .clicked()
+                {
+                    self.start_update_check(ui.ctx());
+                }
+                match &self.update_state {
+                    UpdateState::Idle => {
+                        ui.label("Updates are downloaded from GitHub Releases.");
+                    }
+                    UpdateState::Checking => {
+                        ui.label("Checking GitHub…");
+                    }
+                    UpdateState::UpToDate => {
+                        ui.label("You have the latest release.");
+                    }
+                    UpdateState::Downloading => {
+                        ui.label("Downloading and verifying update…");
+                    }
+                    UpdateState::Error(error) => {
+                        ui.colored_label(Color32::from_rgb(190, 40, 40), error);
+                    }
+                    UpdateState::Available(info) => {
+                        ui.label(format!("Version {} is available.", info.version));
+                        if !info.notes.trim().is_empty() {
+                            egui::CollapsingHeader::new("Release notes").show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(150.0)
+                                    .show(ui, |ui| {
+                                        ui.label(&info.notes);
+                                    });
+                            });
+                        }
+                        ui.label("Installing will close and restart the app.");
+                        let update = info.clone();
+                        if ui
+                            .button("Download and Install")
+                            .on_hover_text(
+                                "The app will close and restart after the update is installed.",
+                            )
+                            .clicked()
+                        {
+                            self.start_update_download(update, ui.ctx());
+                        }
+                    }
+                }
+            });
+    }
+
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_state = UpdateState::Checking;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = updater::check().map_err(|err| format!("{err:#}"));
+            let _ = tx.send(UpdateMessage::Checked(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_update_download(&mut self, info: UpdateInfo, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_state = UpdateState::Downloading;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = updater::prepare(&info).map_err(|err| format!("{err:#}"));
+            let _ = tx.send(UpdateMessage::Prepared(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_app_update(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.update_rx.as_ref() else {
+            return;
+        };
+        let message = match rx.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.update_rx = None;
+                self.update_state =
+                    UpdateState::Error("The update task stopped unexpectedly.".to_owned());
+                return;
+            }
+        };
+        self.update_rx = None;
+        match message {
+            UpdateMessage::Checked(Ok(Some(info))) => {
+                self.update_state = UpdateState::Available(info)
+            }
+            UpdateMessage::Checked(Ok(None)) => self.update_state = UpdateState::UpToDate,
+            UpdateMessage::Checked(Err(error)) | UpdateMessage::Prepared(Err(error)) => {
+                self.update_state = UpdateState::Error(error)
+            }
+            UpdateMessage::Prepared(Ok(update)) => match updater::launch_helper(update) {
+                Ok(child) => {
+                    self.update_helper = Some(child);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(err) => self.update_state = UpdateState::Error(format!("{err:#}")),
+            },
+        }
     }
 
     fn show_input_section(&mut self, ui: &mut egui::Ui) {

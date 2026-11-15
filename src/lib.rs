@@ -21,3 +21,4 @@ pub mod inkstitch;
 pub mod model;
 pub mod preview;
 pub mod shv;
+pub mod updater;
