@@ -1,6 +1,6 @@
 //! Windows whole-disk access. Volume handles cannot address the complete Gotek bank.
 use super::*;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::OsString;
 use std::mem::size_of;
@@ -71,11 +71,11 @@ fn property<T: Copy>(file: &File, id: i32) -> Result<T> {
     );
     Ok(unsafe { std::ptr::read_unaligned(result.as_ptr().cast::<T>()) })
 }
-fn open_volume_for_query(path: &Path) -> Result<File> {
+fn open_device_for_query(path: &Path) -> Result<File> {
     OpenOptions::new()
         .access_mode(0)
         .open(path)
-        .with_context(|| format!("opening volume {} for identification", path.display()))
+        .with_context(|| format!("opening {} for identification", path.display()))
 }
 fn open_raw(path: &Path, write: bool) -> Result<File> {
     OpenOptions::new()
@@ -148,7 +148,7 @@ pub(super) fn resolve_disk_path(path: &Path) -> Result<PathBuf> {
     let letter = super::windows_drive_letter_path(&path.to_string_lossy())
         .context("expected a drive letter or PhysicalDrive path")?;
     let volume = super::windows_raw_volume_path(letter);
-    let file = open_volume_for_query(&volume)?;
+    let file = open_device_for_query(&volume)?;
     Ok(disk_path(single_zero_extent(
         &extents(&file)
             .with_context(|| format!("resolving {} to a physical disk", volume.display()))?,
@@ -176,23 +176,20 @@ impl Drop for Aligned {
     }
 }
 fn alignment(file: &File) -> Result<usize> {
-    let a: STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR =
-        property(file, StorageAccessAlignmentProperty).context("querying disk sector alignment")?;
-    let logical = a.BytesPerLogicalSector as usize;
-    let physical = a.BytesPerPhysicalSector as usize;
-    ensure!(
-        logical.is_power_of_two()
-            && physical.is_power_of_two()
-            && a.BytesOffsetForSectorAlignment == 0,
-        "unsupported disk sector alignment"
-    );
-    let align = logical.max(physical);
-    ensure!(
-        FLOPPY_SIZE % align == 0 && SLOT_PADDING % align == 0,
-        "Gotek slots are not aligned to this disk's {align}-byte sectors"
-    );
-    Ok(align)
+    let reported =
+        property::<STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR>(file, StorageAccessAlignmentProperty)
+            .map(|a| super::device_alignment::ReportedAlignment {
+                logical: a.BytesPerLogicalSector,
+                physical: a.BytesPerPhysicalSector,
+                offset: a.BytesOffsetForSectorAlignment,
+            })
+            .context("querying disk sector alignment");
+    super::device_alignment::determine_alignment(reported, || {
+        let geometry = query::<DISK_GEOMETRY>(file, IOCTL_DISK_GET_DRIVE_GEOMETRY)?;
+        Ok(geometry.BytesPerSector)
+    })
 }
+
 fn length(file: &File) -> Result<u64> {
     let len = query::<GET_LENGTH_INFORMATION>(file, IOCTL_DISK_GET_LENGTH_INFO)?.Length;
     ensure!(len > 0, "disk has no accessible capacity");
@@ -221,7 +218,7 @@ pub(super) fn read_slot(path: &Path, offset: u64) -> Result<Vec<u8>> {
     );
     read_at(&mut file, offset, FLOPPY_SIZE)
 }
-pub(super) fn check_device(path: &Path) -> Result<GotekDeviceCheck> {
+fn probe_device(path: &Path) -> Result<GotekDeviceCheck> {
     let disk = resolve_disk_path(path)?;
     let mut file = open_raw(&disk, false)?;
     let size = length(&file).context("querying disk capacity")?;
@@ -229,19 +226,26 @@ pub(super) fn check_device(path: &Path) -> Result<GotekDeviceCheck> {
         size >= FLOPPY_SIZE as u64,
         "disk is smaller than one Gotek slot"
     );
-    ensure!(
-        is_valid_fat12_1440(&read_at(&mut file, 0, FLOPPY_SIZE)?),
-        "{} does not look like an initialized Gotek device: slot 0 is not a valid 1.44MB FAT12 floppy image",
-        disk.display()
-    );
+    let slot0_valid_fat12_1440 = is_valid_fat12_1440(&read_at(&mut file, 0, FLOPPY_SIZE)?);
     Ok(GotekDeviceCheck {
         device: disk,
         size_bytes: Some(size),
         slot_count: Some(size / SLOT_STRIDE as u64),
         is_regular_file: false,
-        slot0_valid_fat12_1440: true,
+        slot0_valid_fat12_1440,
     })
 }
+
+pub(super) fn check_device(path: &Path) -> Result<GotekDeviceCheck> {
+    let check = probe_device(path)?;
+    ensure!(
+        check.slot0_valid_fat12_1440,
+        "{} does not look like an initialized Gotek device: slot 0 is not a valid 1.44MB FAT12 floppy image",
+        check.device.display()
+    );
+    Ok(check)
+}
+
 struct VolumeSearch(windows_sys::Win32::Foundation::HANDLE);
 impl Drop for VolumeSearch {
     fn drop(&mut self) {
@@ -305,7 +309,7 @@ fn volume_locks(disk_number: u32) -> Result<Vec<File>> {
         if matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, 4 | 5) {
             return Ok(None);
         }
-        let file = match open_volume_for_query(volume) {
+        let file = match open_device_for_query(volume) {
             Ok(file) => file,
             // Empty optical drives and inaccessible volumes cannot identify disk extents.
             Err(err) => {
@@ -475,7 +479,7 @@ fn usb_disk_numbers() -> Result<(Vec<u32>, bool)> {
             .position(|v| *v == 0)
             .context("unterminated disk interface path")?;
         let path = PathBuf::from(OsString::from_wide(&wide[..end]));
-        let file = match open_raw(&path, false) {
+        let file = match open_device_for_query(&path) {
             Ok(file) => file,
             Err(err) => {
                 access_denied |= is_access_denied(&err);
@@ -519,13 +523,22 @@ fn disk_letters(disk: &Path) -> Vec<String> {
 }
 pub(super) fn candidates() -> Result<(Vec<GotekDeviceCandidate>, Option<String>)> {
     let mut result = Vec::new();
-    let (disks, mut access_denied) = usb_disk_numbers()?;
+    let (disks, access_denied) = usb_disk_numbers()?;
+    let mut warnings = Vec::new();
+    if access_denied {
+        warnings.push(
+            "Some disks could not be identified; try running Designer 1 as administrator"
+                .to_owned(),
+        );
+    }
     for n in disks {
         let path = disk_path(n);
-        let check = match check_device(&path) {
-            Ok(check) => check,
-            Err(e) => {
-                access_denied |= is_access_denied(&e);
+        let check = match probe_device(&path) {
+            Ok(check) if check.slot0_valid_fat12_1440 => check,
+            // Ordinary USB disks are expected not to contain a Gotek floppy in slot 0.
+            Ok(_) => continue,
+            Err(err) => {
+                warnings.push(format!("{}: {err:#}", path.display()));
                 continue;
             }
         };
@@ -543,11 +556,7 @@ pub(super) fn candidates() -> Result<(Vec<GotekDeviceCandidate>, Option<String>)
         );
         result.push(GotekDeviceCandidate { path, label, check });
     }
-    if result.is_empty() && access_denied {
-        bail!("USB disks could not be inspected; run Designer 1 as administrator");
-    }
-    let warning = access_denied
-        .then(|| "Some disks could not be inspected; run Designer 1 as administrator".to_owned());
+    let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
     Ok((result, warning))
 }
 
@@ -581,7 +590,7 @@ mod tests {
         let result = acquire_volumes(vec![PathBuf::from("a"), PathBuf::from("b")], |_| {
             calls += 1;
             if calls == 2 {
-                bail!("lock failed");
+                anyhow::bail!("lock failed");
             }
             Ok(Some(Lock(dropped.clone())))
         });

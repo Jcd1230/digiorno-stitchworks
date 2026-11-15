@@ -9,6 +9,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "gotek_alignment.rs"]
+mod device_alignment;
+
 #[cfg(target_os = "windows")]
 #[path = "gotek_windows.rs"]
 mod windows_device;

@@ -143,6 +143,7 @@ struct Designer1App {
     last_open_dir: PathBuf,
     gotek_device_path: String,
     gotek_devices: Vec<GotekDeviceCandidate>,
+    gotek_discovery_warning: Option<String>,
     gotek_slot: u16,
     gotek_export_mode: GotekExportMode,
     gotek_slot_inspection: Option<SlotInspection>,
@@ -190,6 +191,7 @@ impl Default for Designer1App {
             last_open_dir: initial_open_dir(),
             gotek_device_path: String::new(),
             gotek_devices: Vec::new(),
+            gotek_discovery_warning: None,
             gotek_slot: 1,
             gotek_export_mode: GotekExportMode::SingleMenu,
             gotek_slot_inspection: None,
@@ -545,13 +547,12 @@ impl Designer1App {
         match discover_gotek_devices() {
             Ok((devices, warning)) => {
                 self.gotek_devices = devices;
-                if let Some(warning) = warning {
-                    self.status = warning;
-                }
+                self.gotek_discovery_warning = warning;
             }
             Err(err) => {
                 self.gotek_devices.clear();
-                self.status = format!("Gotek device discovery failed: {err:#}");
+                self.gotek_discovery_warning =
+                    Some(format!("Gotek device discovery failed: {err:#}"));
             }
         }
         if self.gotek_device_path.trim().is_empty() {
@@ -797,7 +798,7 @@ impl Designer1App {
         let tx = self.gotek_inspection_tx.clone();
         self.gotek_inspection_loading = true;
         std::thread::spawn(move || {
-            let result = inspect_slot(&device, slot).map_err(|err| err.to_string());
+            let result = inspect_slot(&device, slot).map_err(|err| format!("{err:#}"));
             let _ = tx.send(GotekInspectionMessage {
                 generation,
                 device,
@@ -1216,6 +1217,9 @@ impl Designer1App {
                         self.refresh_gotek_devices();
                     }
                 });
+                if let Some(warning) = &self.gotek_discovery_warning {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
                 if self.gotek_devices.is_empty() {
                     ui.label("No initialized Gotek devices detected.");
                 } else {
