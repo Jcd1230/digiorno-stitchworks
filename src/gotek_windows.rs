@@ -9,7 +9,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, ERROR_NO_MORE_ITEMS, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::*;
@@ -280,7 +282,8 @@ fn volumes() -> Result<Vec<PathBuf>> {
         buf.fill(0);
         if unsafe { FindNextVolumeW(handle, buf.as_mut_ptr(), buf.len() as u32) } == 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as i32) {
+            // FindNextVolume uses the file-search completion code, unlike SetupDi.
+            if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 break;
             }
             return Err(err).context("enumerating volumes");
@@ -563,6 +566,20 @@ pub(super) fn candidates() -> Result<(Vec<GotekDeviceCandidate>, Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enumerates_windows_volumes_to_completion() {
+        let paths = volumes().expect("volume enumeration should finish without an error");
+        assert!(!paths.is_empty(), "Windows should have a system volume");
+        for path in paths {
+            let name = path.to_string_lossy();
+            assert!(name.to_ascii_lowercase().starts_with(r"\\?\volume{"));
+            assert!(
+                name.ends_with('}'),
+                "volume handles must omit the trailing slash"
+            );
+        }
+    }
 
     #[test]
     fn write_bounds_include_padding_and_overflow() {
